@@ -68,8 +68,8 @@ jobs:
         run: |
           git clone -q --depth 1 -b "${{ steps.up.outputs.tag }}" https://github.com/AlexxIT/go2rtc.git src
           cd src
-          python3 ../patch.py
-          git --no-pager diff --stat
+          bash ../apply-patches.sh
+          git --no-pager diff --cached --stat
 
       - uses: actions/setup-go@v5
         if: steps.skip.outputs.skip != 'true'
@@ -82,6 +82,14 @@ jobs:
         if: steps.skip.outputs.skip != 'true'
         working-directory: src
         run: go build ./...
+
+      # Only the packages the patches touch; some other upstream tests already fail.
+      - name: Test patched packages
+        if: steps.skip.outputs.skip != 'true'
+        working-directory: src
+        run: |
+          go test -count=1 ./pkg/webrtc/ ./pkg/rtsp/ ./pkg/tcp/ ./internal/rtsp/
+          go test -count=1 -run Keyframe ./internal/streams/
 
       - uses: docker/setup-qemu-action@v3
         if: steps.skip.outputs.skip != 'true'
@@ -121,7 +129,7 @@ jobs:
           push: true
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=go2rtc ${{ steps.up.outputs.tag }} with the WebRTC NACK fix
+            org.opencontainers.image.description=go2rtc ${{ steps.up.outputs.tag }} with WebRTC NACK retransmission, a NACK resend limit and keyframe requests
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ steps.up.outputs.tag }}

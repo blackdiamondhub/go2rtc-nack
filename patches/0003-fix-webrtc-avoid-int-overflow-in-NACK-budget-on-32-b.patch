@@ -1,0 +1,108 @@
+From 2e7ad748d2b4823706409f34391c1e7174b0848c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bj=C3=B6rn=20Strausmann?= <projects@strausmann.ch>
+Date: Sat, 14 Nov 2026 14:22:09 +0000
+Subject: [PATCH] fix(webrtc): avoid int overflow in NACK budget on 32-bit
+ platforms
+
+The window budget was computed as bytes/s * nanoseconds in int. On 32-bit
+platforms (386, arm/v6, arm/v7, mipsle) 2 MiB/s * 500 ms overflows to -1,
+so the limiter dropped every NACK and no packet was ever retransmitted
+(GOARCH=386: TestConnectionRetransmitsNack and both limiter tests red).
+
+Use int64 for all byte counts and budgets in the limiter and add a
+deterministic test for the window budget.
+---
+ pkg/webrtc/nack_limit_test.go | 11 +++++++++++
+ pkg/webrtc/nack_limiter.go    | 15 ++++++++-------
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/pkg/webrtc/nack_limit_test.go b/pkg/webrtc/nack_limit_test.go
+index 0765783..e183427 100644
+--- a/pkg/webrtc/nack_limit_test.go
++++ b/pkg/webrtc/nack_limit_test.go
+@@ -197,3 +197,14 @@ func TestNackResendsPerSequenceAreLimited(t *testing.T) {
+ 		require.GreaterOrEqual(t, resends, 1, "seq %d was never repaired", seq)
+ 	}
+ }
++
++// The window budget must not overflow on 32-bit platforms (386, arm/v6,
++// arm/v7, mipsle): 2 MiB/s * 500 ms computed in nanoseconds exceeds int32.
++// A negative budget would drop every NACK. Run with GOARCH=386 to cover it.
++func TestNackLimiterWindowBudgetFitsAllArchs(t *testing.T) {
++	f := newNackLimiter(nackMaxResendBytesPerSec, nackMaxResendsPerSeq)
++	i, err := f.NewInterceptor("")
++	require.NoError(t, err)
++	l := i.(*nackLimiter)
++	require.EqualValues(t, nackMaxResendBytesPerSec/2, l.maxWindowBytes)
++}
+diff --git a/pkg/webrtc/nack_limiter.go b/pkg/webrtc/nack_limiter.go
+index 536b353..5a83ddd 100644
+--- a/pkg/webrtc/nack_limiter.go
++++ b/pkg/webrtc/nack_limiter.go
+@@ -42,7 +42,7 @@ const nackBucketCount = 10
+ 
+ // windowCounter sums bytes over the last nackWindow in fixed buckets.
+ type windowCounter struct {
+-	bytes [nackBucketCount]int
++	bytes [nackBucketCount]int64
+ 	stamp [nackBucketCount]int64
+ }
+ 
+@@ -50,7 +50,7 @@ func (w *windowCounter) bucket(now time.Time) int64 {
+ 	return now.UnixNano() / int64(nackWindow/nackBucketCount)
+ }
+ 
+-func (w *windowCounter) add(now time.Time, n int) {
++func (w *windowCounter) add(now time.Time, n int64) {
+ 	idx := w.bucket(now)
+ 	slot := idx % nackBucketCount
+ 	if w.stamp[slot] != idx {
+@@ -60,7 +60,7 @@ func (w *windowCounter) add(now time.Time, n int) {
+ 	w.bytes[slot] += n
+ }
+ 
+-func (w *windowCounter) sum(now time.Time) (total int) {
++func (w *windowCounter) sum(now time.Time) (total int64) {
+ 	idx := w.bucket(now)
+ 	for i := range w.bytes {
+ 		if idx-w.stamp[i] < nackBucketCount {
+@@ -72,7 +72,7 @@ func (w *windowCounter) sum(now time.Time) (total int) {
+ 
+ type nackHistoryEntry struct {
+ 	seq     uint16
+-	size    int
++	size    int64
+ 	resends int
+ 	valid   bool
+ }
+@@ -103,7 +103,8 @@ func newNackLimiter(maxResendBytesPerSec, maxResendsPerSeq int) interceptor.Fact
+ 
+ func (f *nackLimiterFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
+ 	return &nackLimiter{
+-		maxWindowBytes:   f.maxResendBytesPerSec * int(nackWindow) / int(time.Second),
++		// int64: on 32-bit platforms bytes * nanoseconds overflows int.
++		maxWindowBytes:   int64(f.maxResendBytesPerSec) * int64(nackWindow) / int64(time.Second),
+ 		maxResendsPerSeq: f.maxResendsPerSeq,
+ 		streams:          map[uint32]*nackLimiterStream{},
+ 		now:              time.Now,
+@@ -113,7 +114,7 @@ func (f *nackLimiterFactory) NewInterceptor(string) (interceptor.Interceptor, er
+ type nackLimiter struct {
+ 	interceptor.NoOp
+ 
+-	maxWindowBytes   int
++	maxWindowBytes   int64
+ 	maxResendsPerSeq int
+ 	now              func() time.Time
+ 
+@@ -131,7 +132,7 @@ func (l *nackLimiter) BindLocalStream(info *interceptor.StreamInfo, writer inter
+ 	l.mu.Unlock()
+ 
+ 	return interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, attr interceptor.Attributes) (int, error) {
+-		size := header.MarshalSize() + len(payload)
++		size := int64(header.MarshalSize() + len(payload))
+ 		l.mu.Lock()
+ 		entry := &stream.history[header.SequenceNumber%nackBufferSize]
+ 		if !entry.valid || entry.seq != header.SequenceNumber {
+-- 
+2.56.1.vfs.0.1
+

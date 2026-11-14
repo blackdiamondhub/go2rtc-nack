@@ -27,7 +27,7 @@ Tags:
 ## How it stays current
 
 `.github/workflows/build.yml` runs daily. When upstream publishes a new release
-it clones that tag, applies `patch.py`, builds, vets, smoke-tests and pushes. If
+it clones that tag, applies `patch.py`, builds, smoke-tests and pushes. If
 upstream changes the code the patch hooks into, `patch.py` fails and the build
 goes red rather than shipping an unpatched image. If upstream ships this same
 fix, `patch.py` leaves the source alone.

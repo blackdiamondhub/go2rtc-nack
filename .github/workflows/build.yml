@@ -1,0 +1,129 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream go2rtc tag (default latest release)
+        required: false
+      force:
+        description: Rebuild even if the image already exists
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve upstream release
+        id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag=$(gh api repos/AlexxIT/go2rtc/releases/latest --jq .tag_name)
+          rev=$(git rev-parse --short=7 HEAD)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$tag-nack-$rev" >> "$GITHUB_OUTPUT"
+          echo "Upstream $tag, patch rev $rev"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Skip if already built
+        id: skip
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" != "true" ]; }; then
+            if docker manifest inspect "$IMAGE:${{ steps.up.outputs.image_tag }}" >/dev/null 2>&1; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "$IMAGE:${{ steps.up.outputs.image_tag }} already exists"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch and patch go2rtc
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          git clone -q --depth 1 -b "${{ steps.up.outputs.tag }}" https://github.com/AlexxIT/go2rtc.git src
+          cd src
+          python3 ../patch.py
+          git --no-pager diff --stat
+
+      - uses: actions/setup-go@v5
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: Build and vet patched package
+        if: steps.skip.outputs.skip != 'true'
+        working-directory: src
+        run: |
+          go build ./...
+          go vet ./pkg/webrtc/
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.skip.outputs.skip != 'true'
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.skip.outputs.skip != 'true'
+
+      - name: Build test image
+        if: steps.skip.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: go2rtc-nack:test
+
+      - name: Smoke test
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          mkdir -p /tmp/cfg
+          printf 'api:\n  listen: ":1984"\nwebrtc:\n  listen: ":8555"\nstreams:\n  test: "ffmpeg:virtual?video#video=h264"\n' > /tmp/cfg/go2rtc.yaml
+          docker run -d --name g2 -p 1984:1984 -v /tmp/cfg:/config go2rtc-nack:test
+          for i in $(seq 1 30); do curl -sf http://localhost:1984/api >/dev/null && break; sleep 1; done
+          curl -sf http://localhost:1984/api
+          curl -sf http://localhost:1984/api/streams | grep -q test
+          docker logs g2
+          docker rm -f g2
+
+      - name: Push image
+        if: steps.skip.outputs.skip != 'true' && github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=go2rtc ${{ steps.up.outputs.tag }} with the WebRTC NACK fix
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.up.outputs.tag }}
+            ${{ env.IMAGE }}:${{ steps.up.outputs.image_tag }}

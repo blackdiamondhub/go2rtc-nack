@@ -1,0 +1,3056 @@
+From 2de3094d683b5e0aca44a2ea0796c39532a4a2a1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bj=C3=B6rn=20Strausmann?= <projects@strausmann.ch>
+Date: Sat, 14 Nov 2026 14:22:09 +0000
+Subject: [PATCH] feat: request a source keyframe when a WebRTC viewer sends
+ PLI/FIR
+
+Some sources (UniFi Protect) ignore RTCP PLI/FIR and emit an IDR frame
+only once per GOP, so a WebRTC viewer that joins or loses a frame waits
+up to several seconds for a picture. They do emit an IDR frame when a new
+RTSP session sets up the video track.
+
+- webrtc: read PLI/FIR from the RTCP feedback of each sender and forward
+  a keyframe request for video tracks to the stream's producer.
+- rtsp: new source option #keyframe=resetup. RequestKeyframe opens a short
+  helper session (OPTIONS, DESCRIBE, SETUP, TEARDOWN, always
+  TCP-interleaved, no redirect): at most one per second and never two at
+  the same time per source connection, overall deadline, aborted by Stop.
+  Errors carry only stage and error class, never URL, credentials or
+  host:port. WebSocket transports are refused.
+- tcp: bound the TLS handshake by the dial timeout, add DialContext, and
+  reject invalid or oversized (> 16 MiB) Content-Length values instead of
+  panicking.
+- webrtc: keep the RTCP read loop alive across a single unparsable packet
+  (ends on read end or after 64 consecutive errors).
+
+Off by default; sources without the option behave as before.
+---
+ internal/rtsp/README.md           |  18 +
+ internal/rtsp/keyframe_test.go    | 117 ++++
+ internal/rtsp/rtsp.go             |  40 ++
+ internal/streams/add_consumer.go  |   9 +
+ internal/streams/keyframe_test.go | 182 ++++++
+ internal/streams/producer.go      |  21 +
+ internal/webrtc/webrtc.go         |   1 +
+ pkg/core/keyframe.go              |  19 +
+ pkg/rtsp/client.go                |  35 +-
+ pkg/rtsp/client_test.go           |  31 +-
+ pkg/rtsp/conn.go                  |  18 +
+ pkg/rtsp/keyframe.go              | 267 +++++++++
+ pkg/rtsp/keyframe_linux_test.go   |  64 +++
+ pkg/rtsp/keyframe_test.go         | 885 ++++++++++++++++++++++++++++++
+ pkg/rtsp/producer.go              |   2 +
+ pkg/tcp/content_length_test.go    |  52 ++
+ pkg/tcp/dial.go                   |  21 +-
+ pkg/tcp/dial_test.go              | 111 ++++
+ pkg/tcp/textproto.go              |  24 +-
+ pkg/webrtc/conn.go                |  15 +-
+ pkg/webrtc/keyframe.go            | 136 +++++
+ pkg/webrtc/keyframe_test.go       | 301 ++++++++++
+ pkg/webrtc/log.go                 |  10 +
+ pkg/webrtc/nack_limit_test.go     |  67 +++
+ pkg/webrtc/nack_limiter.go        |  18 +-
+ pkg/webrtc/nack_test.go           |  50 +-
+ pkg/webrtc/rtcp_log_test.go       |  50 ++
+ 27 files changed, 2533 insertions(+), 31 deletions(-)
+ create mode 100644 internal/rtsp/keyframe_test.go
+ create mode 100644 internal/streams/keyframe_test.go
+ create mode 100644 pkg/core/keyframe.go
+ create mode 100644 pkg/rtsp/keyframe.go
+ create mode 100644 pkg/rtsp/keyframe_linux_test.go
+ create mode 100644 pkg/rtsp/keyframe_test.go
+ create mode 100644 pkg/tcp/content_length_test.go
+ create mode 100644 pkg/tcp/dial_test.go
+ create mode 100644 pkg/webrtc/keyframe.go
+ create mode 100644 pkg/webrtc/keyframe_test.go
+ create mode 100644 pkg/webrtc/log.go
+ create mode 100644 pkg/webrtc/rtcp_log_test.go
+
+diff --git a/internal/rtsp/README.md b/internal/rtsp/README.md
+index cd7c84a..fab04a5 100644
+--- a/internal/rtsp/README.md
++++ b/internal/rtsp/README.md
+@@ -42,6 +42,24 @@ Format: `rtsp...#{param1}#{param2}#{param3}`
+ - Ignore audio - `#media=video` or ignore video - `#media=audio`
+ - Ignore two-way audio API `#backchannel=0` - important for some glitchy cameras
+ - Use WebSocket transport `#transport=ws...`
++- Request a keyframe from the source when a WebRTC viewer asks for one `#keyframe=resetup` - for sources that ignore PLI/FIR, e.g. UniFi Protect (see below)
++
++### Keyframe on viewer request
++
++Some sources (for example UniFi Protect) ignore RTCP PLI/FIR and send a keyframe only once per GOP, so a WebRTC viewer that joins or loses a frame waits for the next GOP. They do send a keyframe when a new RTSP session sets up the video track. With `#keyframe=resetup` go2rtc uses this on demand:
++
++```yaml
++streams:
++  doorbell: rtspx://192.0.2.10:7441/camera-token#keyframe=resetup
++```
++
++When a WebRTC viewer sends PLI or FIR for a video track, go2rtc opens a short helper session to the same URL (OPTIONS, DESCRIBE, SETUP, TEARDOWN; no PLAY, always TCP-interleaved, no redirects).
++
++- At most one helper session per second per source connection, shared by all viewers. Requests inside that window are dropped.
++- Never two helper sessions at the same time on one connection. The RTSP exchange after the dial is limited to 2 s.
++- Failures never affect the main stream and are logged at debug level without URL or credentials.
++- Only `rtsp://`, `rtsps://` and `rtspx://` sources are supported; WebSocket transports are refused. Any other option value logs a warning and leaves the feature off.
++- The keyframe comes from the source's shared encoder, so it also reaches other sessions (e.g. recordings). A viewer that keeps sending PLI raises the keyframe rate to at most one per second.
+ 
+ ### RTSP over WebSocket
+ 
+diff --git a/internal/rtsp/keyframe_test.go b/internal/rtsp/keyframe_test.go
+new file mode 100644
+index 0000000..bd490a0
+--- /dev/null
++++ b/internal/rtsp/keyframe_test.go
+@@ -0,0 +1,117 @@
++package rtsp
++
++import (
++	"bytes"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/pkg/rtsp"
++	"github.com/rs/zerolog"
++)
++
++func TestParseKeyframe(t *testing.T) {
++	tests := []struct {
++		name     string
++		rawQuery string
++		wantMode string
++		wantOK   bool
++	}{
++		{"no query", "", "", true},
++		{"other parameter only", "timeout=5", "", true},
++		{"resetup", "keyframe=resetup", "resetup", true},
++		{"resetup among others", "timeout=5#keyframe=resetup#media=video", "resetup", true},
++		{"unknown value", "keyframe=yes", "", false},
++		{"empty value", "keyframe=", "", false},
++		{"bare parameter", "keyframe", "", false},
++		{"first value wins", "keyframe=resetup#keyframe=x", "resetup", true},
++		{"first value wins, invalid first", "keyframe=x#keyframe=resetup", "", false},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			query := streams.ParseQuery(tc.rawQuery)
++			mode, ok := parseKeyframe(query)
++			if mode != tc.wantMode || ok != tc.wantOK {
++				t.Fatalf("parseKeyframe(%q) = (%q, %t), want (%q, %t)", tc.rawQuery, mode, ok, tc.wantMode, tc.wantOK)
++			}
++		})
++	}
++}
++
++func TestKeyframeLoggerDebugOnly(t *testing.T) {
++	cause := errors.New("rtsp: keyframe helper failed: describe: timeout")
++
++	t.Run("info level stays silent", func(t *testing.T) {
++		var buf bytes.Buffer
++		l := zerolog.New(&buf).Level(zerolog.InfoLevel)
++		keyframeLogger(l)(cause, 1500*time.Millisecond)
++		if buf.Len() != 0 {
++			t.Fatalf("expected no output at info level, got %q", buf.String())
++		}
++	})
++
++	t.Run("debug level logs one line", func(t *testing.T) {
++		var buf bytes.Buffer
++		l := zerolog.New(&buf).Level(zerolog.DebugLevel)
++		keyframeLogger(l)(cause, 1500*time.Millisecond)
++		out := buf.String()
++		if n := strings.Count(out, "\n"); n != 1 {
++			t.Fatalf("expected exactly one line, got %d: %q", n, out)
++		}
++		for _, want := range []string{`"level":"debug"`, "describe: timeout", "1500"} {
++			if !strings.Contains(out, want) {
++				t.Errorf("output %q does not contain %q", out, want)
++			}
++		}
++	})
++
++	t.Run("success is logged without error", func(t *testing.T) {
++		var buf bytes.Buffer
++		l := zerolog.New(&buf).Level(zerolog.DebugLevel)
++		keyframeLogger(l)(nil, 20*time.Millisecond)
++		out := buf.String()
++		if !strings.Contains(out, `"level":"debug"`) || strings.Contains(out, `"error"`) {
++			t.Fatalf("unexpected output %q", out)
++		}
++	})
++}
++
++func TestApplyKeyframe(t *testing.T) {
++	tests := []struct {
++		name     string
++		rawQuery string
++		wantMode string
++		wantHook bool
++		wantWarn bool
++	}{
++		{"off by default", "timeout=5", "", false, false},
++		{"resetup", "keyframe=resetup", rtsp.KeyframeResetup, true, false},
++		{"bare parameter", "keyframe", "", false, true},
++		{"unknown value", "keyframe=yes", "", false, true},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			var buf bytes.Buffer
++			l := zerolog.New(&buf)
++			conn := rtsp.NewClient("rtsp://example.invalid/stream")
++
++			applyKeyframe(conn, streams.ParseQuery(tc.rawQuery), l)
++
++			if conn.Keyframe != tc.wantMode {
++				t.Errorf("Keyframe = %q, want %q", conn.Keyframe, tc.wantMode)
++			}
++			if (conn.OnKeyframe != nil) != tc.wantHook {
++				t.Errorf("OnKeyframe set = %t, want %t", conn.OnKeyframe != nil, tc.wantHook)
++			}
++			out := buf.String()
++			if warned := strings.Contains(out, `"level":"warn"`); warned != tc.wantWarn {
++				t.Errorf("warning logged = %t, want %t (%q)", warned, tc.wantWarn, out)
++			}
++			if strings.Contains(out, "example.invalid") {
++				t.Errorf("warning contains the URL: %q", out)
++			}
++		})
++	}
++}
+diff --git a/internal/rtsp/rtsp.go b/internal/rtsp/rtsp.go
+index 31c2c5d..d8c6a40 100644
+--- a/internal/rtsp/rtsp.go
++++ b/internal/rtsp/rtsp.go
+@@ -6,6 +6,7 @@ import (
+ 	"net"
+ 	"net/url"
+ 	"strings"
++	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/internal/app"
+ 	"github.com/AlexxIT/go2rtc/internal/streams"
+@@ -105,6 +106,8 @@ func rtspHandler(rawURL string) (core.Producer, error) {
+ 		conn.Media = query.Get("media")
+ 		conn.Timeout = core.Atoi(query.Get("timeout"))
+ 		conn.Transport = query.Get("transport")
++
++		applyKeyframe(conn, query, log)
+ 	}
+ 
+ 	if log.Trace().Enabled() {
+@@ -143,6 +146,43 @@ func rtspHandler(rawURL string) (core.Producer, error) {
+ 	return conn, nil
+ }
+ 
++// parseKeyframe reads the #keyframe=... source option. A missing option is
++// valid and means off. Any value other than rtsp.KeyframeResetup is reported
++// as not ok, so the caller can warn and keep the feature off. For a repeated
++// parameter the first value counts.
++func parseKeyframe(query url.Values) (mode string, ok bool) {
++	vals, found := query["keyframe"]
++	if !found || len(vals) == 0 {
++		return "", true
++	}
++	if vals[0] == rtsp.KeyframeResetup {
++		return rtsp.KeyframeResetup, true
++	}
++	return "", false
++}
++
++// applyKeyframe configures the keyframe option of conn from the source query.
++// An unknown value logs a warning (without URL) and leaves the feature off.
++func applyKeyframe(conn *rtsp.Conn, query url.Values, l zerolog.Logger) {
++	mode, ok := parseKeyframe(query)
++	if !ok {
++		l.Warn().Msg("[rtsp] unknown keyframe mode, keyframe requests disabled")
++	}
++	conn.Keyframe = mode
++	if mode != "" {
++		conn.OnKeyframe = keyframeLogger(l)
++	}
++}
++
++// keyframeLogger reports the result of each keyframe helper session on debug
++// level only. The error texts of the helper contain only stage and class, and
++// the source URL is deliberately never logged here.
++func keyframeLogger(l zerolog.Logger) func(err error, took time.Duration) {
++	return func(err error, took time.Duration) {
++		l.Debug().Err(err).Dur("took", took).Msg("[rtsp] keyframe helper session")
++	}
++}
++
+ func tcpHandler(conn *rtsp.Conn) {
+ 	var name string
+ 	var closer func()
+diff --git a/internal/streams/add_consumer.go b/internal/streams/add_consumer.go
+index 7400ce6..85d226a 100644
+--- a/internal/streams/add_consumer.go
++++ b/internal/streams/add_consumer.go
+@@ -68,6 +68,15 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
+ 						continue
+ 					}
+ 
++					// Forward viewer keyframe requests (PLI/FIR) to the producer.
++					// Errors are not logged: throttled and busy cases would be noise.
++					if prodMedia.Kind == core.KindVideo {
++						if src, ok := cons.(core.KeyframeRequestSource); ok {
++							prod := prod
++							src.OnKeyframeRequest(consMedia, func() { _ = prod.RequestKeyframe() })
++						}
++					}
++
+ 				case core.DirectionSendonly:
+ 					log.Trace().Msgf("[streams] match cons=%d => prod=%d", consN, prodN)
+ 
+diff --git a/internal/streams/keyframe_test.go b/internal/streams/keyframe_test.go
+new file mode 100644
+index 0000000..c62bc19
+--- /dev/null
++++ b/internal/streams/keyframe_test.go
+@@ -0,0 +1,182 @@
++package streams
++
++import (
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/stretchr/testify/require"
++)
++
++// fakeKeyframeProducer is a recvonly video+audio producer that counts keyframe requests.
++type fakeKeyframeProducer struct {
++	calls atomic.Int32
++	done  chan struct{}
++	once  sync.Once
++}
++
++func newFakeKeyframeProducer() *fakeKeyframeProducer {
++	return &fakeKeyframeProducer{done: make(chan struct{})}
++}
++
++func (f *fakeKeyframeProducer) GetMedias() []*core.Media {
++	return []*core.Media{
++		{Kind: core.KindVideo, Direction: core.DirectionRecvonly,
++			Codecs: []*core.Codec{{Name: core.CodecH264, ClockRate: 90000}}},
++		{Kind: core.KindAudio, Direction: core.DirectionRecvonly,
++			Codecs: []*core.Codec{{Name: core.CodecPCMA, ClockRate: 8000}}},
++	}
++}
++
++func (f *fakeKeyframeProducer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
++	return core.NewReceiver(media, codec), nil
++}
++
++func (f *fakeKeyframeProducer) Start() error { <-f.done; return nil }
++func (f *fakeKeyframeProducer) Stop() error  { f.once.Do(func() { close(f.done) }); return nil }
++
++func (f *fakeKeyframeProducer) RequestKeyframe() error {
++	f.calls.Add(1)
++	return nil
++}
++
++// plainProducer has no RequestKeyframe method.
++type plainProducer struct{ fakeKeyframeProducer }
++
++func (*plainProducer) RequestKeyframe() {}
++
++// fakeKeyframeConsumer is a sendonly video+audio consumer that stores handlers per media ID.
++type fakeKeyframeConsumer struct {
++	mu       sync.Mutex
++	handlers map[string]func()
++}
++
++func (c *fakeKeyframeConsumer) GetMedias() []*core.Media {
++	return []*core.Media{
++		{ID: "v", Kind: core.KindVideo, Direction: core.DirectionSendonly,
++			Codecs: []*core.Codec{{Name: core.CodecH264, ClockRate: 90000}}},
++		{ID: "a", Kind: core.KindAudio, Direction: core.DirectionSendonly,
++			Codecs: []*core.Codec{{Name: core.CodecPCMA, ClockRate: 8000}}},
++	}
++}
++
++// AddTrack binds a sender so the producer counts as having readers
++// (otherwise AddConsumer stops it again).
++func (c *fakeKeyframeConsumer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
++	// Bind is deprecated, but it is how a sender counts as a reader of the track here
++	core.NewSender(media, codec).Bind(track) //nolint:staticcheck // SA1019: see above
++	return nil
++}
++
++func (c *fakeKeyframeConsumer) Stop() error { return nil }
++
++func (c *fakeKeyframeConsumer) OnKeyframeRequest(media *core.Media, handler func()) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.handlers == nil {
++		c.handlers = map[string]func(){}
++	}
++	c.handlers[media.ID] = handler
++}
++
++func (c *fakeKeyframeConsumer) handler(id string) func() {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return c.handlers[id]
++}
++
++// newKeyframeStream registers the kftest scheme (process-wide state, cleaned up
++// afterwards) and returns a stream whose single producer wraps prod.
++func newKeyframeStream(t *testing.T, prod core.Producer) *Stream {
++	t.Helper()
++	HandleFunc("kftest", func(string) (core.Producer, error) { return prod, nil })
++	stream := NewStream("kftest:a")
++	t.Cleanup(func() {
++		delete(handlers, "kftest")
++		for _, p := range stream.producers {
++			// invalidate the worker so reconnect does not run after the test
++			p.mu.Lock()
++			p.workerID++
++			p.mu.Unlock()
++		}
++		_ = prod.Stop() //nolint:staticcheck // SA1019: Stop is the core.Producer method
++	})
++	return stream
++}
++
++func TestAddConsumerWiresKeyframeForVideo(t *testing.T) {
++	prod := newFakeKeyframeProducer()
++	stream := newKeyframeStream(t, prod)
++
++	cons := &fakeKeyframeConsumer{}
++	require.NoError(t, stream.AddConsumer(cons))
++
++	require.Nil(t, cons.handler("a"), "audio must not get a keyframe handler")
++	h := cons.handler("v")
++	require.NotNil(t, h)
++
++	h()
++	require.EqualValues(t, 1, prod.calls.Load())
++}
++
++func TestAddConsumerKeyframeSharedByConsumers(t *testing.T) {
++	prod := newFakeKeyframeProducer()
++	stream := newKeyframeStream(t, prod)
++
++	c1, c2 := &fakeKeyframeConsumer{}, &fakeKeyframeConsumer{}
++	require.NoError(t, stream.AddConsumer(c1))
++	require.NoError(t, stream.AddConsumer(c2))
++
++	c1.handler("v")()
++	c2.handler("v")()
++	require.EqualValues(t, 2, prod.calls.Load())
++}
++
++func TestProducerRequestKeyframeFollowsConn(t *testing.T) {
++	first := newFakeKeyframeProducer()
++	stream := newKeyframeStream(t, first)
++
++	cons := &fakeKeyframeConsumer{}
++	require.NoError(t, stream.AddConsumer(cons))
++
++	// simulate reconnect: the producer gets a new connection
++	second := newFakeKeyframeProducer()
++	p := stream.producers[0]
++	p.mu.Lock()
++	p.conn = second
++	p.mu.Unlock()
++
++	cons.handler("v")()
++	require.EqualValues(t, 0, first.calls.Load())
++	require.EqualValues(t, 1, second.calls.Load())
++}
++
++func TestProducerRequestKeyframeDoesNotBlock(t *testing.T) {
++	p := &Producer{conn: newFakeKeyframeProducer()}
++
++	p.mu.Lock()
++	defer p.mu.Unlock()
++
++	errc := make(chan error, 1)
++	go func() { errc <- p.RequestKeyframe() }()
++
++	select {
++	case err := <-errc:
++		require.ErrorIs(t, err, errProducerBusy)
++	case <-time.After(50 * time.Millisecond):
++		t.Fatal("RequestKeyframe blocked on the producer mutex")
++	}
++}
++
++func TestProducerRequestKeyframeUnsupported(t *testing.T) {
++	p := &Producer{conn: &plainProducer{}}
++	err := p.RequestKeyframe()
++	require.True(t, errors.Is(err, core.ErrKeyframeUnsupported))
++
++	p = &Producer{}
++	err = p.RequestKeyframe()
++	require.True(t, errors.Is(err, core.ErrKeyframeUnsupported))
++}
+diff --git a/internal/streams/producer.go b/internal/streams/producer.go
+index 09e2dcc..1817e73 100644
+--- a/internal/streams/producer.go
++++ b/internal/streams/producer.go
+@@ -38,6 +38,9 @@ type Producer struct {
+ 
+ const SourceTemplate = "{input}"
+ 
++// errProducerBusy is returned by RequestKeyframe when the producer mutex is held.
++var errProducerBusy = errors.New("streams: producer busy")
++
+ func NewProducer(source string) *Producer {
+ 	if strings.Contains(source, SourceTemplate) {
+ 		return &Producer{template: source}
+@@ -131,6 +134,24 @@ func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Re
+ 	return nil
+ }
+ 
++// RequestKeyframe asks the current connection for a new keyframe. It is called
++// from viewer RTCP read loops, so it never waits for the producer mutex and
++// calls the connection only after releasing it. While the mutex is held (dial
++// or reconnect of the source) the request is dropped; the viewer repeats the
++// PLI if it still needs a keyframe.
++func (p *Producer) RequestKeyframe() error {
++	if !p.mu.TryLock() {
++		return errProducerBusy
++	}
++	conn := p.conn
++	p.mu.Unlock()
++
++	if r, ok := conn.(core.KeyframeRequester); ok {
++		return r.RequestKeyframe()
++	}
++	return core.ErrKeyframeUnsupported
++}
++
+ func (p *Producer) MarshalJSON() ([]byte, error) {
+ 	if conn := p.conn; conn != nil {
+ 		return json.Marshal(conn)
+diff --git a/internal/webrtc/webrtc.go b/internal/webrtc/webrtc.go
+index 2a5b4ad..5c9f296 100644
+--- a/internal/webrtc/webrtc.go
++++ b/internal/webrtc/webrtc.go
+@@ -33,6 +33,7 @@ func Init() {
+ 	app.LoadConfig(&cfg)
+ 
+ 	log = app.GetLogger("webrtc")
++	webrtc.SetLogger(log)
+ 
+ 	if log.Debug().Enabled() {
+ 		itfs, _ := net.Interfaces()
+diff --git a/pkg/core/keyframe.go b/pkg/core/keyframe.go
+new file mode 100644
+index 0000000..3e856d2
+--- /dev/null
++++ b/pkg/core/keyframe.go
+@@ -0,0 +1,19 @@
++package core
++
++import "errors"
++
++// KeyframeRequester is a producer that can ask its source for a new keyframe,
++// for example after a viewer sent RTCP PLI/FIR.
++// RequestKeyframe must return immediately and never block on network I/O.
++type KeyframeRequester interface {
++	RequestKeyframe() error
++}
++
++// KeyframeRequestSource is a consumer that reports keyframe requests from its
++// viewers (RTCP PLI/FIR) for the given media.
++type KeyframeRequestSource interface {
++	OnKeyframeRequest(media *Media, handler func())
++}
++
++// ErrKeyframeUnsupported is returned by producers that cannot request a keyframe.
++var ErrKeyframeUnsupported = errors.New("keyframe request not supported")
+diff --git a/pkg/rtsp/client.go b/pkg/rtsp/client.go
+index c960732..5030a28 100644
+--- a/pkg/rtsp/client.go
++++ b/pkg/rtsp/client.go
+@@ -2,6 +2,7 @@ package rtsp
+ 
+ import (
+ 	"bufio"
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"net"
+@@ -31,6 +32,12 @@ func NewClient(uri string) *Conn {
+ }
+ 
+ func (c *Conn) Dial() (err error) {
++	return c.dial(context.Background())
++}
++
++// dial is Dial with a context that aborts the TCP connect and TLS handshake.
++// The WebSocket transport ignores ctx.
++func (c *Conn) dial(ctx context.Context) (err error) {
+ 	if c.URL, err = url.Parse(c.uri); err != nil {
+ 		return
+ 	}
+@@ -45,7 +52,7 @@ func (c *Conn) Dial() (err error) {
+ 		} else {
+ 			timeout = core.ConnDialTimeout
+ 		}
+-		conn, err = tcp.Dial(c.URL, timeout)
++		conn, err = tcp.DialContext(ctx, c.URL, timeout)
+ 
+ 		if c.Transport != "udp" {
+ 			c.Protocol = "rtsp+tcp"
+@@ -98,6 +105,10 @@ func (c *Conn) Do(req *tcp.Request) (*tcp.Response, error) {
+ 		return res, nil
+ 
+ 	case http.StatusMovedPermanently, http.StatusFound:
++		if c.noRedirect {
++			return nil, errRedirectRefused
++		}
++
+ 		rawURL := res.Header.Get("Location")
+ 
+ 		var u *url.URL
+@@ -127,17 +138,33 @@ func (c *Conn) Do(req *tcp.Request) (*tcp.Response, error) {
+ 			if c.auth.ReadNone(res) {
+ 				return c.Do(req)
+ 			}
+-			return nil, errors.New("user/pass not provided")
++			return nil, errAuthMissing
+ 		case tcp.AuthUnknown:
+ 			if c.auth.Read(res) {
+ 				return c.Do(req)
+ 			}
+ 		default:
+-			return nil, errors.New("wrong user/pass")
++			return nil, errAuthWrong
+ 		}
+ 	}
+ 
+-	return res, fmt.Errorf("wrong response on %s", req.Method)
++	return res, &responseError{method: req.Method, code: res.StatusCode}
++}
++
++var (
++	errAuthMissing     = errors.New("user/pass not provided")
++	errAuthWrong       = errors.New("wrong user/pass")
++	errRedirectRefused = errors.New("rtsp: redirect not allowed")
++)
++
++// responseError is a non-200 response that Do could not handle.
++type responseError struct {
++	method string
++	code   int
++}
++
++func (e *responseError) Error() string {
++	return "wrong response on " + e.method
+ }
+ 
+ func (c *Conn) Options() error {
+diff --git a/pkg/rtsp/client_test.go b/pkg/rtsp/client_test.go
+index 5d714a5..0dfe653 100644
+--- a/pkg/rtsp/client_test.go
++++ b/pkg/rtsp/client_test.go
+@@ -9,7 +9,17 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++// defaultTimeout is the package default, read before any test changes Timeout.
++var defaultTimeout = Timeout
++
++// restoreTimeout restores the package wide Timeout after the test.
++func restoreTimeout(t *testing.T) {
++	old := Timeout
++	t.Cleanup(func() { Timeout = old })
++}
++
+ func TestTimeout(t *testing.T) {
++	restoreTimeout(t)
+ 	Timeout = time.Millisecond
+ 
+ 	ln, err := net.Listen("tcp", "localhost:0")
+@@ -25,20 +35,36 @@ func TestTimeout(t *testing.T) {
+ 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+ }
+ 
++// TestTimeoutRestored must run after TestTimeout: it fails if TestTimeout
++// leaks its Timeout value into later tests.
++func TestTimeoutRestored(t *testing.T) {
++	require.Equal(t, defaultTimeout, Timeout)
++}
++
+ func TestMissedControl(t *testing.T) {
++	restoreTimeout(t)
+ 	Timeout = time.Millisecond
+ 
+ 	ln, err := net.Listen("tcp", "localhost:0")
+ 	require.Nil(t, err)
+ 
++	t.Cleanup(func() { _ = ln.Close() })
++
+ 	go func() {
+ 		conn, err := ln.Accept()
+-		require.Nil(t, err)
++		if err != nil {
++			return
++		}
++		defer func() { _ = conn.Close() }()
+ 
+ 		b := make([]byte, 8192)
+ 		for {
++			// the read ends when the client connection is closed, possibly
++			// after this test returned, so it must not report to t
+ 			n, err := conn.Read(b)
+-			require.Nil(t, err)
++			if err != nil {
++				return
++			}
+ 
+ 			req := string(b[:n])
+ 
+@@ -84,6 +110,7 @@ Session: 1
+ 
+ 	err = client.Dial()
+ 	require.Nil(t, err)
++	t.Cleanup(func() { _ = client.conn.Close() })
+ 
+ 	err = client.Describe()
+ 	require.Nil(t, err)
+diff --git a/pkg/rtsp/conn.go b/pkg/rtsp/conn.go
+index 2984c78..a12dd84 100644
+--- a/pkg/rtsp/conn.go
++++ b/pkg/rtsp/conn.go
+@@ -33,6 +33,11 @@ type Conn struct {
+ 
+ 	URL *url.URL
+ 
++	// Keyframe enables RequestKeyframe; the only supported value is KeyframeResetup
++	Keyframe string
++	// OnKeyframe is called after each helper session of RequestKeyframe
++	OnKeyframe func(err error, took time.Duration)
++
+ 	// internal
+ 
+ 	auth      *tcp.Auth
+@@ -51,6 +56,19 @@ type Conn struct {
+ 
+ 	udpConn []*net.UDPConn
+ 	udpAddr []*net.UDPAddr
++
++	// noRedirect makes Do fail on 301/302 instead of dialing the new location
++	noRedirect bool
++
++	// keyframe helper session (RequestKeyframe)
++	kfMu     sync.Mutex
++	kfBusy   bool
++	kfClosed bool
++	kfLast   time.Time
++	kfRaw    net.Conn           // raw connection of the running helper session
++	kfCancel context.CancelFunc // aborts the dial of the running helper session
++	kfWG     sync.WaitGroup
++	kfNow    func() time.Time // nil = time.Now
+ }
+ 
+ const (
+diff --git a/pkg/rtsp/keyframe.go b/pkg/rtsp/keyframe.go
+new file mode 100644
+index 0000000..a5476b8
+--- /dev/null
++++ b/pkg/rtsp/keyframe.go
+@@ -0,0 +1,267 @@
++package rtsp
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/url"
++	"os"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++)
++
++// KeyframeResetup enables keyframe requests through a short helper session:
++// OPTIONS, DESCRIBE, SETUP of the first video track, TEARDOWN (no PLAY).
++// Some cameras (UniFi Protect) ignore RTCP PLI/FIR but emit an IDR frame for
++// all sessions when a new session sets up the video track.
++const KeyframeResetup = "resetup"
++
++var (
++	ErrKeyframeDisabled   = errors.New("rtsp: keyframe request disabled")
++	ErrKeyframeNotPlaying = errors.New("rtsp: keyframe request: source not playing")
++	ErrKeyframeThrottled  = errors.New("rtsp: keyframe request throttled")
++	ErrKeyframeBusy       = errors.New("rtsp: keyframe request: connection busy")
++	ErrKeyframeClosed     = errors.New("rtsp: keyframe request: connection closed")
++	// ErrKeyframeTransport is returned for sources with a WebSocket transport:
++	// the dial of that transport has no timeout, a helper session could hang
++	// in it for good.
++	ErrKeyframeTransport = errors.New("rtsp: keyframe request: transport not supported")
++	// ErrKeyframeFailed is the root of every error of the helper session.
++	// The message carries only the stage and an error class, never the
++	// text of the inner error (it may contain the URL, credentials or host).
++	ErrKeyframeFailed = errors.New("rtsp: keyframe helper failed")
++)
++
++var (
++	// keyframeInterval is the minimum time between two helper sessions.
++	keyframeInterval = time.Second
++	// keyframeTimeout limits the RTSP exchange of one helper session after dial.
++	keyframeTimeout = 2 * time.Second
++)
++
++var errKeyframeNoVideo = errors.New("rtsp: no video media")
++
++var _ core.KeyframeRequester = (*Conn)(nil)
++
++// RequestKeyframe starts a helper session that makes the source emit a
++// keyframe. It never blocks: the session runs in its own goroutine, the
++// result is reported through OnKeyframe. At most one helper session runs at a
++// time and at most one starts per keyframeInterval; other requests are dropped.
++// Both limits apply per connection: after a reconnect of the source the new
++// connection starts with fresh limits. Stop of the old connection aborts its
++// helper session in every phase (TCP connect, TLS handshake, RTSP exchange)
++// but does not wait for it, so the two overlap at most for the moment the
++// aborted helper needs to return.
++func (c *Conn) RequestKeyframe() error {
++	if c.Keyframe != KeyframeResetup {
++		return ErrKeyframeDisabled
++	}
++
++	if c.Transport != "" && c.Transport != "tcp" && c.Transport != "udp" {
++		return ErrKeyframeTransport
++	}
++
++	// the caller is the RTCP read loop: never wait for a lock.
++	// Lock order is kfMu before stateMu; nobody takes kfMu under stateMu.
++	// kfMu is only held briefly, so losing the TryLock race is rare; the
++	// request is dropped like a throttled one and the viewer asks again.
++	if !c.kfMu.TryLock() {
++		return ErrKeyframeBusy
++	}
++	defer c.kfMu.Unlock()
++
++	if c.kfClosed {
++		return ErrKeyframeClosed
++	}
++
++	// stateMu is held over network I/O (Reconnect, Play, TEARDOWN)
++	if !c.stateMu.TryLock() {
++		return ErrKeyframeBusy
++	}
++	if c.mode != core.ModeActiveProducer || c.state != StatePlay {
++		c.stateMu.Unlock()
++		return ErrKeyframeNotPlaying
++	}
++	uri := c.uri
++	c.stateMu.Unlock()
++
++	now := c.keyframeNow()
++
++	if c.kfBusy || now.Sub(c.kfLast) < keyframeInterval {
++		return ErrKeyframeThrottled
++	}
++
++	ctx, cancel := context.WithCancel(context.Background())
++
++	c.kfLast = now
++	c.kfBusy = true
++	c.kfCancel = cancel
++	c.kfWG.Add(1)
++	go c.runKeyframeHelper(ctx, uri)
++
++	return nil
++}
++
++func (c *Conn) keyframeNow() time.Time {
++	if c.kfNow != nil {
++		return c.kfNow()
++	}
++	return time.Now()
++}
++
++func (c *Conn) runKeyframeHelper(ctx context.Context, uri string) {
++	start := time.Now()
++
++	defer c.kfWG.Done()
++
++	err := c.keyframeSession(ctx, uri)
++
++	c.kfMu.Lock()
++	cancel := c.kfCancel
++	c.kfRaw = nil
++	c.kfCancel = nil
++	c.kfBusy = false
++	c.kfMu.Unlock()
++
++	cancel() // releases the context; stopKeyframe may have called it already
++
++	if c.OnKeyframe != nil {
++		c.OnKeyframe(err, time.Since(start))
++	}
++}
++
++func (c *Conn) keyframeSession(ctx context.Context, uri string) (err error) {
++	helper := NewClient(uri)
++	helper.UserAgent = c.UserAgent
++	helper.Timeout = c.Timeout
++	// Never UDP: the helper never plays, so a UDP port pair would be opened
++	// for nothing. RequestKeyframe has already refused WebSocket transports.
++	if c.Transport != "udp" {
++		helper.Transport = c.Transport
++	}
++	// Backchannel must stay false: SetupMedia redials when SETUP fails on a
++	// backchannel connection, and that new connection would be neither in kfRaw
++	// nor under the deadline below.
++	helper.Backchannel = false
++	helper.noRedirect = true
++
++	// ctx is cancelled by stopKeyframe: Stop ends a helper that is still in
++	// TCP connect or TLS handshake at once, not only after the dial timeout
++	if err = helper.dial(ctx); err != nil {
++		return keyframeError("dial", err, false)
++	}
++
++	raw := helper.conn
++
++	c.kfMu.Lock()
++	if c.kfClosed {
++		c.kfMu.Unlock()
++		_ = raw.Close()
++		return fmt.Errorf("%w: %w", ErrKeyframeFailed, ErrKeyframeClosed)
++	}
++	c.kfRaw = raw
++	c.kfMu.Unlock()
++
++	// the helper session never dials again (no redirect, no reconnect),
++	// so closing this raw connection ends every blocking call of it
++	var timedOut atomic.Bool
++	timer := time.AfterFunc(keyframeTimeout, func() {
++		timedOut.Store(true)
++		_ = raw.Close()
++	})
++	defer timer.Stop()
++
++	defer func() {
++		_ = helper.Close() // sends TEARDOWN once Describe has set the mode
++	}()
++
++	if err = helper.Options(); err != nil {
++		return keyframeError("options", err, timedOut.Load())
++	}
++	if err = helper.Describe(); err != nil {
++		return keyframeError("describe", err, timedOut.Load())
++	}
++
++	var video *core.Media
++	for _, media := range helper.Medias {
++		if media.Kind == core.KindVideo && media.Direction == core.DirectionRecvonly {
++			video = media
++			break
++		}
++	}
++	if video == nil {
++		return keyframeError("setup", errKeyframeNoVideo, false)
++	}
++
++	if _, err = helper.SetupMedia(video); err != nil {
++		return keyframeError("setup", err, timedOut.Load())
++	}
++
++	return nil
++}
++
++// stopKeyframe marks the connection closed, aborts the dial of a running
++// helper session and closes its raw connection. It does not wait for the
++// helper goroutine; that one ends right after (no blocking call remains).
++func (c *Conn) stopKeyframe() {
++	c.kfMu.Lock()
++	c.kfClosed = true
++	raw := c.kfRaw
++	cancel := c.kfCancel
++	c.kfMu.Unlock()
++
++	if cancel != nil {
++		cancel()
++	}
++
++	// close outside kfMu: a *tls.Conn sends close_notify with a write deadline,
++	// RequestKeyframe must not wait for that
++	if raw != nil {
++		_ = raw.Close() // net.Conn is safe for concurrent use
++	}
++}
++
++// keyframeError builds an error from stage and error class only.
++// The inner error is deliberately not wrapped: its text may contain
++// the source URL, credentials, the URL path or host:port.
++func keyframeError(stage string, err error, timedOut bool) error {
++	class := keyframeErrorClass(err)
++	if timedOut {
++		class = "timeout"
++	}
++	return fmt.Errorf("%w: %s: %s", ErrKeyframeFailed, stage, class)
++}
++
++func keyframeErrorClass(err error) string {
++	var netErr net.Error
++	var urlErr *url.Error
++	var resErr *responseError
++
++	switch {
++	case errors.Is(err, os.ErrDeadlineExceeded),
++		errors.As(err, &netErr) && netErr.Timeout():
++		return "timeout"
++	case errors.Is(err, net.ErrClosed), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
++		errors.Is(err, context.Canceled): // dial aborted by stopKeyframe
++		return "closed"
++	case errors.Is(err, syscall.ECONNREFUSED):
++		return "refused"
++	case errors.Is(err, errAuthMissing), errors.Is(err, errAuthWrong),
++		errors.As(err, &resErr) && resErr.code == 401:
++		return "auth"
++	case errors.Is(err, errRedirectRefused):
++		return "redirect"
++	case errors.As(err, &urlErr):
++		return "parse"
++	case errors.As(err, &resErr):
++		return "response"
++	case errors.Is(err, errKeyframeNoVideo):
++		return "no-video"
++	}
++	return "other"
++}
+diff --git a/pkg/rtsp/keyframe_linux_test.go b/pkg/rtsp/keyframe_linux_test.go
+new file mode 100644
+index 0000000..f16681e
+--- /dev/null
++++ b/pkg/rtsp/keyframe_linux_test.go
+@@ -0,0 +1,64 @@
++//go:build linux
++
++package rtsp
++
++import (
++	"errors"
++	"net"
++	"strconv"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// synDropAddr returns the address of a listening socket with backlog 0 that
++// never accepts. Once its accept queue is full, the kernel drops further SYNs
++// and connect() hangs until the dial timeout.
++func synDropAddr(t *testing.T) string {
++	t.Helper()
++
++	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = syscall.Close(fd) })
++	require.NoError(t, syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}))
++	require.NoError(t, syscall.Listen(fd, 0))
++	sa, err := syscall.Getsockname(fd)
++	require.NoError(t, err)
++	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(sa.(*syscall.SockaddrInet4).Port))
++
++	// fill the accept queue
++	for i := 0; i < 4; i++ {
++		if conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
++			t.Cleanup(func() { _ = conn.Close() })
++		}
++	}
++
++	// the precondition of the test: a further connect really hangs
++	_, err = net.DialTimeout("tcp", addr, 300*time.Millisecond)
++	var netErr net.Error
++	if !errors.As(err, &netErr) || !netErr.Timeout() {
++		t.Skipf("connect to a full accept queue does not hang here: %v", err)
++	}
++	return addr
++}
++
++func TestStopEndsKeyframeHelperInTCPConnect(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	addr := synDropAddr(t)
++	c := newSetupConn(t, srv)
++	c.Timeout = 5 // dial timeout of the helper in seconds; set before Start
++	startPlaying(t, srv, c)
++
++	// nothing is accepted, so the dial phase is reached once the helper runs
++	// for a while without a result
++	dialing := make(chan struct{})
++	go func() {
++		time.Sleep(100 * time.Millisecond)
++		close(dialing)
++	}()
++
++	assertStopEndsDialingHelper(t, srv, c, "rtsp://user:pass@"+addr+"/SECRETPATHTOKEN", dialing)
++}
+diff --git a/pkg/rtsp/keyframe_test.go b/pkg/rtsp/keyframe_test.go
+new file mode 100644
+index 0000000..500e1c6
+--- /dev/null
++++ b/pkg/rtsp/keyframe_test.go
+@@ -0,0 +1,885 @@
++package rtsp
++
++import (
++	"bufio"
++	"fmt"
++	"io"
++	"net"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/stretchr/testify/require"
++)
++
++// fakeRTSPServer answers just enough RTSP for one main session plus helper
++// sessions. Its behaviour can be changed after the main session is playing.
++type fakeRTSPServer struct {
++	t  *testing.T
++	ln net.Listener
++
++	mu             sync.Mutex
++	describeStatus int
++	setupStatus    int
++	contentBase    string
++	hangSetup      bool
++	redirectSetup  string
++	counts         map[string]int
++	open           map[net.Conn]struct{}
++	active         int
++	maxActive      int // max simultaneous connections minus the first one
++	accepted       int
++	setupTransport []string // Transport header of every SETUP request
++
++	wg sync.WaitGroup
++}
++
++func newFakeRTSPServer(t *testing.T) *fakeRTSPServer {
++	t.Helper()
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++
++	s := &fakeRTSPServer{
++		t:              t,
++		ln:             ln,
++		describeStatus: 200,
++		setupStatus:    200,
++		counts:         map[string]int{},
++		open:           map[net.Conn]struct{}{},
++	}
++
++	s.wg.Add(1)
++	go s.serve()
++
++	t.Cleanup(func() {
++		_ = ln.Close()
++		s.mu.Lock()
++		for conn := range s.open {
++			_ = conn.Close()
++		}
++		s.mu.Unlock()
++		s.wg.Wait()
++	})
++
++	return s
++}
++
++func (s *fakeRTSPServer) addr() string { return s.ln.Addr().String() }
++
++func (s *fakeRTSPServer) set(f func(s *fakeRTSPServer)) {
++	s.mu.Lock()
++	f(s)
++	s.mu.Unlock()
++}
++
++func (s *fakeRTSPServer) count(method string) int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.counts[method]
++}
++
++func (s *fakeRTSPServer) conns() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.active
++}
++
++func (s *fakeRTSPServer) maxHelpers() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.maxActive
++}
++
++func (s *fakeRTSPServer) acceptedConns() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return s.accepted
++}
++
++func (s *fakeRTSPServer) setupTransports() []string {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return append([]string(nil), s.setupTransport...)
++}
++
++func (s *fakeRTSPServer) serve() {
++	defer s.wg.Done()
++	for {
++		conn, err := s.ln.Accept()
++		if err != nil {
++			return
++		}
++
++		s.mu.Lock()
++		s.open[conn] = struct{}{}
++		s.accepted++
++		s.active++
++		if s.active-1 > s.maxActive {
++			s.maxActive = s.active - 1
++		}
++		s.mu.Unlock()
++
++		s.wg.Add(1)
++		go s.handle(conn)
++	}
++}
++
++func (s *fakeRTSPServer) handle(conn net.Conn) {
++	defer s.wg.Done()
++	defer func() {
++		_ = conn.Close()
++		s.mu.Lock()
++		delete(s.open, conn)
++		s.active--
++		s.mu.Unlock()
++	}()
++
++	r := bufio.NewReader(conn)
++	for {
++		// read one request up to the empty line
++		var method, cseq, transport string
++		for first := true; ; first = false {
++			line, err := r.ReadString('\n')
++			if err != nil {
++				return
++			}
++			line = strings.TrimRight(line, "\r\n")
++			if line == "" {
++				break
++			}
++			if first {
++				method, _, _ = strings.Cut(line, " ")
++			} else if k, v, ok := strings.Cut(line, ":"); ok {
++				switch {
++				case strings.EqualFold(k, "CSeq"):
++					cseq = strings.TrimSpace(v)
++				case strings.EqualFold(k, "Transport"):
++					transport = strings.TrimSpace(v)
++				}
++			}
++		}
++
++		s.mu.Lock()
++		s.counts[method]++
++		if method == MethodSetup {
++			s.setupTransport = append(s.setupTransport, transport)
++		}
++		describeStatus := s.describeStatus
++		setupStatus := s.setupStatus
++		contentBase := s.contentBase
++		hangSetup := s.hangSetup
++		redirectSetup := s.redirectSetup
++		s.mu.Unlock()
++
++		var res string
++		switch method {
++		case MethodOptions, MethodPlay:
++			res = "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\n\r\n"
++		case MethodDescribe:
++			if describeStatus != 200 {
++				res = fmt.Sprintf("RTSP/1.0 %d Error\r\nCSeq: %s\r\n\r\n", describeStatus, cseq)
++				break
++			}
++			sdp := "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=fake\r\nt=0 0\r\n" +
++				"m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:trackID=0\r\n"
++			res = "RTSP/1.0 200 OK\r\nCSeq: " + cseq + "\r\nContent-Type: application/sdp\r\n"
++			if contentBase != "" {
++				res += "Content-Base: " + contentBase + "\r\n"
++			}
++			res += fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(sdp), sdp)
++		case MethodSetup:
++			if hangSetup {
++				continue
++			}
++			if redirectSetup != "" {
++				res = "RTSP/1.0 302 Found\r\nCSeq: " + cseq + "\r\nLocation: " + redirectSetup + "\r\n\r\n"
++				break
++			}
++			if setupStatus != 200 {
++				res = fmt.Sprintf("RTSP/1.0 %d Error\r\nCSeq: %s\r\n\r\n", setupStatus, cseq)
++				break
++			}
++			res = "RTSP/1.0 200 OK\r\nCSeq: " + cseq +
++				"\r\nSession: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n"
++		case MethodTeardown:
++			continue
++		default:
++			res = "RTSP/1.0 501 Not Implemented\r\nCSeq: " + cseq + "\r\n\r\n"
++		}
++
++		if _, err := conn.Write([]byte(res)); err != nil {
++			return
++		}
++	}
++}
++
++// withKeyframeGlobals saves and restores the package wide timing values.
++// Register it before newPlayingConn so that its cleanup runs last.
++func withKeyframeGlobals(t *testing.T, interval, timeout time.Duration) {
++	t.Helper()
++	oldTimeout, oldInterval, oldKfTimeout := Timeout, keyframeInterval, keyframeTimeout
++	Timeout = 2 * time.Second
++	keyframeInterval = interval
++	keyframeTimeout = timeout
++	t.Cleanup(func() {
++		Timeout, keyframeInterval, keyframeTimeout = oldTimeout, oldInterval, oldKfTimeout
++	})
++}
++
++// fakeClock is a settable clock for the throttle.
++type fakeClock struct {
++	mu  sync.Mutex
++	now time.Time
++}
++
++func newFakeClock(c *Conn) *fakeClock {
++	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
++	c.kfNow = clock.Now
++	return clock
++}
++
++func (f *fakeClock) Now() time.Time {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.now
++}
++
++func (f *fakeClock) Add(d time.Duration) {
++	f.mu.Lock()
++	f.now = f.now.Add(d)
++	f.mu.Unlock()
++}
++
++// keyframeResults collects OnKeyframe callbacks.
++type keyframeResults struct {
++	ch chan error
++	n  atomic.Int32
++}
++
++func watchKeyframe(c *Conn) *keyframeResults {
++	r := &keyframeResults{ch: make(chan error, 1000)}
++	c.OnKeyframe = func(err error, took time.Duration) {
++		r.n.Add(1)
++		r.ch <- err
++	}
++	return r
++}
++
++func (r *keyframeResults) wait(t *testing.T, d time.Duration) error {
++	t.Helper()
++	select {
++	case err := <-r.ch:
++		return err
++	case <-time.After(d):
++		t.Fatalf("no OnKeyframe callback within %v", d)
++		return nil
++	}
++}
++
++func testURL(srv *fakeRTSPServer) string {
++	return "rtsp://user:pass@" + srv.addr() + "/SECRETPATHTOKEN"
++}
++
++// newSetupConn returns a connection after DESCRIBE and SETUP, before PLAY.
++func newSetupConn(t *testing.T, srv *fakeRTSPServer) *Conn {
++	t.Helper()
++
++	c := NewClient(testURL(srv))
++	c.Keyframe = KeyframeResetup
++	require.NoError(t, c.Dial())
++	require.NoError(t, c.Describe())
++
++	var video *core.Media
++	for _, media := range c.Medias {
++		if media.Kind == core.KindVideo {
++			video = media
++		}
++	}
++	require.NotNil(t, video)
++	_, err := c.GetTrack(video, video.Codecs[0])
++	require.NoError(t, err)
++
++	t.Cleanup(func() {
++		_ = c.Stop()
++		waitKeyframeHelpers(t, c)
++	})
++	return c
++}
++
++// newPlayingConn returns a connection in state PLAY with its read loop running.
++func newPlayingConn(t *testing.T, srv *fakeRTSPServer) *Conn {
++	t.Helper()
++	c := newSetupConn(t, srv)
++	startPlaying(t, srv, c)
++	return c
++}
++
++// startPlaying runs Start of a connection from newSetupConn and waits for PLAY.
++func startPlaying(t *testing.T, srv *fakeRTSPServer, c *Conn) {
++	t.Helper()
++
++	done := make(chan struct{})
++	go func() {
++		_ = c.Start()
++		close(done)
++	}()
++	playing.Store(c, done)
++	t.Cleanup(func() { endPlaying(t, c) })
++
++	require.Eventually(t, func() bool {
++		c.stateMu.Lock()
++		defer c.stateMu.Unlock()
++		return c.state == StatePlay
++	}, 2*time.Second, 5*time.Millisecond)
++	require.Eventually(t, func() bool { return srv.count(MethodPlay) == 1 }, 2*time.Second, 5*time.Millisecond)
++}
++
++var playing sync.Map // *Conn -> chan struct{} closed when Start returned
++
++// endPlaying ends the read loop of a playing connection before Stop is called.
++// Handle reads c.state without stateMu (upstream code), so a Stop while Handle
++// runs is a data race under -race that has nothing to do with this feature.
++// Closing the raw connection makes Handle and Start return first.
++func endPlaying(t *testing.T, c *Conn) {
++	t.Helper()
++	v, ok := playing.LoadAndDelete(c)
++	if !ok {
++		return
++	}
++	_ = c.conn.Close()
++	select {
++	case <-v.(chan struct{}):
++	case <-time.After(3 * time.Second):
++		t.Error("Start did not return after the connection was closed")
++	}
++}
++
++func waitKeyframeHelpers(t *testing.T, c *Conn) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() {
++		c.kfWG.Wait()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(3 * time.Second):
++		t.Error("keyframe helper goroutine did not end")
++	}
++}
++
++func assertNoLeak(t *testing.T, srv *fakeRTSPServer, err error) {
++	t.Helper()
++	require.Error(t, err)
++	msg := err.Error()
++	require.NotContains(t, msg, "user:pass")
++	require.NotContains(t, msg, "SECRETPATHTOKEN")
++	require.NotContains(t, msg, srv.addr())
++	require.NotContains(t, msg, "127.0.0.1")
++	require.ErrorIs(t, err, ErrKeyframeFailed)
++}
++
++func TestRequestKeyframeOpensHelperSession(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	res := watchKeyframe(c)
++
++	require.NoError(t, c.RequestKeyframe())
++
++	require.NoError(t, res.wait(t, 2*time.Second))
++	require.Eventually(t, func() bool { return srv.conns() == 1 }, 2*time.Second, 5*time.Millisecond)
++	require.Equal(t, 1, srv.count(MethodOptions))
++	require.Equal(t, 2, srv.count(MethodDescribe))
++	require.Equal(t, 2, srv.count(MethodSetup))
++	require.Equal(t, 1, srv.count(MethodPlay))
++	require.Equal(t, 1, srv.count(MethodTeardown))
++	require.Equal(t, int32(1), res.n.Load())
++}
++
++func TestRequestKeyframeDisabledByDefault(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	c.Keyframe = ""
++
++	require.ErrorIs(t, c.RequestKeyframe(), ErrKeyframeDisabled)
++	time.Sleep(300 * time.Millisecond)
++	require.Equal(t, 1, srv.count(MethodDescribe))
++}
++
++func TestRequestKeyframeNotPlaying(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newSetupConn(t, srv)
++
++	require.ErrorIs(t, c.RequestKeyframe(), ErrKeyframeNotPlaying)
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, 1, srv.acceptedConns())
++}
++
++func TestRequestKeyframeDoesNotBlockOnStateLock(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++
++	c.stateMu.Lock()
++	result := make(chan error, 1)
++	go func() { result <- c.RequestKeyframe() }()
++
++	select {
++	case err := <-result:
++		c.stateMu.Unlock()
++		require.ErrorIs(t, err, ErrKeyframeBusy)
++	case <-time.After(50 * time.Millisecond):
++		c.stateMu.Unlock()
++		<-result
++		t.Fatal("RequestKeyframe blocked on the state lock")
++	}
++}
++
++func TestRequestKeyframeThrottled(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	clock := newFakeClock(c)
++	res := watchKeyframe(c)
++
++	require.NoError(t, c.RequestKeyframe())
++	// wait for the end of the helper session, so that only the interval
++	// (not the running session) can reject the next request
++	require.NoError(t, res.wait(t, 2*time.Second))
++	require.Eventually(t, func() bool { return srv.conns() == 1 }, 2*time.Second, 5*time.Millisecond)
++
++	clock.Add(500 * time.Millisecond)
++	require.ErrorIs(t, c.RequestKeyframe(), ErrKeyframeThrottled)
++
++	clock.Add(501 * time.Millisecond)
++	require.NoError(t, c.RequestKeyframe())
++	require.NoError(t, res.wait(t, 2*time.Second))
++
++	require.Equal(t, 3, srv.count(MethodSetup))
++}
++
++func TestRequestKeyframeNeverParallel(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	clock := newFakeClock(c)
++	srv.set(func(s *fakeRTSPServer) { s.hangSetup = true })
++
++	require.NoError(t, c.RequestKeyframe())
++	require.Eventually(t, func() bool { return srv.count(MethodSetup) == 2 }, 2*time.Second, 5*time.Millisecond)
++
++	clock.Add(5 * time.Second)
++	require.ErrorIs(t, c.RequestKeyframe(), ErrKeyframeThrottled)
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, 1, srv.maxHelpers())
++}
++
++// floodKeyframe calls RequestKeyframe from 50 goroutines for d.
++func floodKeyframe(c *Conn, d time.Duration) {
++	var wg sync.WaitGroup
++	stop := time.Now().Add(d)
++	for i := 0; i < 50; i++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for time.Now().Before(stop) {
++				_ = c.RequestKeyframe()
++			}
++		}()
++	}
++	wg.Wait()
++}
++
++// The bounds are checked at points the test controls, not by timing: the
++// server counts connections when it accepts them, and the throttle clock only
++// moves when the test moves it. (Counting open connections on the server lags
++// behind the client closing them and made this test flaky under CPU load.)
++func TestRequestKeyframeFloodIsBounded(t *testing.T) {
++	t.Run("one helper at a time", func(t *testing.T) {
++		withKeyframeGlobals(t, time.Second, 10*time.Second)
++		srv := newFakeRTSPServer(t)
++		c := newPlayingConn(t, srv)
++		clock := newFakeClock(c)
++		srv.set(func(s *fakeRTSPServer) { s.hangSetup = true })
++
++		// this helper hangs in SETUP and runs for the whole flood
++		require.NoError(t, c.RequestKeyframe())
++		require.Eventually(t, func() bool { return srv.count(MethodSetup) == 2 }, 2*time.Second, 5*time.Millisecond)
++
++		clock.Add(time.Hour) // only the running helper can reject a request now
++		floodKeyframe(c, 500*time.Millisecond)
++
++		require.Equal(t, 2, srv.acceptedConns(), "main session plus one helper")
++		require.Equal(t, 2, srv.count(MethodSetup))
++	})
++
++	t.Run("one helper per interval", func(t *testing.T) {
++		withKeyframeGlobals(t, time.Second, 2*time.Second)
++		srv := newFakeRTSPServer(t)
++		c := newPlayingConn(t, srv)
++		clock := newFakeClock(c) // frozen: the interval never passes during the flood
++		res := watchKeyframe(c)
++
++		// the first helper has ended before the flood (OnKeyframe runs after
++		// kfBusy is cleared), so only the interval can reject a request
++		require.NoError(t, c.RequestKeyframe())
++		require.NoError(t, res.wait(t, 2*time.Second))
++		floodKeyframe(c, 500*time.Millisecond)
++
++		require.Equal(t, int32(1), res.n.Load())
++		require.Equal(t, 2, srv.acceptedConns(), "main session plus one helper")
++		require.Equal(t, 2, srv.count(MethodSetup))
++
++		// and it is the interval: once it has passed, the next request starts a helper
++		clock.Add(time.Second)
++		require.NoError(t, c.RequestKeyframe())
++		require.NoError(t, res.wait(t, 2*time.Second))
++	})
++}
++
++func TestKeyframeHelperErrorReported(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	res := watchKeyframe(c)
++	srv.set(func(s *fakeRTSPServer) { s.setupStatus = 500 })
++
++	require.NoError(t, c.RequestKeyframe())
++	err := res.wait(t, 2*time.Second)
++	assertNoLeak(t, srv, err)
++	require.Contains(t, err.Error(), "setup: response")
++
++	require.Eventually(t, func() bool { return srv.conns() == 1 }, 2*time.Second, 5*time.Millisecond)
++	c.stateMu.Lock()
++	state := c.state
++	c.stateMu.Unlock()
++	require.Equal(t, StatePlay, state)
++}
++
++// The helper session must never redial. SetupMedia redials once when SETUP
++// fails on a connection with Backchannel set; that new connection would be
++// neither in kfRaw nor under the helper deadline.
++func TestKeyframeHelperNoRedialOnSetupError(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	c.Backchannel = true // normal for RTSP sources; the helper must not inherit it
++	res := watchKeyframe(c)
++	srv.set(func(s *fakeRTSPServer) { s.setupStatus = 500 })
++
++	require.NoError(t, c.RequestKeyframe())
++	err := res.wait(t, 2*time.Second)
++	assertNoLeak(t, srv, err)
++	require.Contains(t, err.Error(), "setup: response")
++
++	// the main connection plus exactly one helper connection
++	require.Equal(t, 2, srv.acceptedConns())
++	require.Equal(t, 2, srv.count(MethodSetup))
++}
++
++// The helper session uses TCP-interleaved even if the source uses UDP:
++// it never plays, so a UDP port pair would be opened for nothing.
++func TestKeyframeHelperNeverUDP(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newSetupConn(t, srv)
++	c.Transport = "udp" // set after the main SETUP and before Start
++	startPlaying(t, srv, c)
++	res := watchKeyframe(c)
++
++	require.NoError(t, c.RequestKeyframe())
++	require.NoError(t, res.wait(t, 2*time.Second))
++
++	transports := srv.setupTransports()
++	require.Len(t, transports, 2)
++	require.Contains(t, transports[1], "RTP/AVP/TCP")
++	require.NotContains(t, transports[1], "client_port")
++}
++
++// A WebSocket transport has no dial timeout, so a helper session could hang
++// in the dial for good: the request is refused before anything is dialed.
++func TestRequestKeyframeRefusedForWebSocketTransport(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newSetupConn(t, srv)
++	c.Transport = "ws://127.0.0.1:1/never-dialed" // set after the main SETUP and before Start
++	startPlaying(t, srv, c)
++
++	require.ErrorIs(t, c.RequestKeyframe(), ErrKeyframeTransport)
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, 1, srv.acceptedConns())
++}
++
++func TestKeyframeHelperUnauthorized(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	res := watchKeyframe(c)
++	srv.set(func(s *fakeRTSPServer) { s.describeStatus = 401 })
++
++	require.NoError(t, c.RequestKeyframe())
++	err := res.wait(t, 2*time.Second)
++	assertNoLeak(t, srv, err)
++	require.Contains(t, err.Error(), "describe: auth")
++}
++
++func TestKeyframeHelperBadContentBase(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	res := watchKeyframe(c)
++	srv.set(func(s *fakeRTSPServer) { s.contentBase = "rtsp://user:pass@h/SECRETPATHTOKEN/%zz" })
++
++	require.NoError(t, c.RequestKeyframe())
++	err := res.wait(t, 2*time.Second)
++	assertNoLeak(t, srv, err)
++	require.Contains(t, err.Error(), "describe: parse")
++}
++
++func TestKeyframeHelperRedirectRejected(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	other := newFakeRTSPServer(t)
++	other.set(func(s *fakeRTSPServer) { s.hangSetup = true })
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	res := watchKeyframe(c)
++	srv.set(func(s *fakeRTSPServer) {
++		s.redirectSetup = "rtsp://" + other.addr() + "/SECRETPATHTOKEN/trackID=0"
++	})
++
++	require.NoError(t, c.RequestKeyframe())
++	err := res.wait(t, time.Second)
++	assertNoLeak(t, srv, err)
++	require.NotContains(t, err.Error(), other.addr())
++	require.Contains(t, err.Error(), "setup: redirect")
++	require.Equal(t, 0, other.acceptedConns())
++}
++
++func TestKeyframeHelperTimeout(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 200*time.Millisecond)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	res := watchKeyframe(c)
++	srv.set(func(s *fakeRTSPServer) { s.hangSetup = true })
++
++	require.NoError(t, c.RequestKeyframe())
++	err := res.wait(t, time.Second)
++	assertNoLeak(t, srv, err)
++	require.Contains(t, err.Error(), "setup: timeout")
++	require.Eventually(t, func() bool { return srv.conns() == 1 }, time.Second, 5*time.Millisecond)
++}
++
++func TestKeyframeHelperNetworkError(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	clock := newFakeClock(c)
++	res := watchKeyframe(c)
++	require.NoError(t, srv.ln.Close())
++
++	require.NoError(t, c.RequestKeyframe())
++	err := res.wait(t, 2*time.Second)
++	assertNoLeak(t, srv, err)
++	require.Contains(t, err.Error(), "dial: refused")
++
++	clock.Add(time.Second)
++	require.NoError(t, c.RequestKeyframe())
++	assertNoLeak(t, srv, res.wait(t, 2*time.Second))
++}
++
++func TestStopCancelsKeyframeHelper(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++	clock := newFakeClock(c)
++	res := watchKeyframe(c)
++	srv.set(func(s *fakeRTSPServer) { s.hangSetup = true })
++
++	require.NoError(t, c.RequestKeyframe())
++	require.Eventually(t, func() bool { return srv.count(MethodSetup) == 2 }, 2*time.Second, 5*time.Millisecond)
++
++	endPlaying(t, c)
++	_ = c.Stop() // reports the close error of the already closed main connection
++
++	require.Eventually(t, func() bool { return srv.conns() == 0 }, 500*time.Millisecond, 5*time.Millisecond)
++	// Stop only closes the raw socket of the helper session. Running the
++	// helper's RTSP Close from Stop would write a TEARDOWN from a second
++	// goroutine; -race does not see that (net.Conn writes synchronize), the
++	// request count does. The main connection was closed before Stop.
++	require.Equal(t, 0, srv.count(MethodTeardown))
++	err := res.wait(t, 500*time.Millisecond)
++	require.ErrorIs(t, err, ErrKeyframeFailed)
++	assertNoLeak(t, srv, err)
++
++	done := make(chan struct{})
++	go func() { c.kfWG.Wait(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(500 * time.Millisecond):
++		t.Fatal("keyframe helper goroutine still running after Stop")
++	}
++
++	accepted := srv.acceptedConns()
++	clock.Add(5 * time.Second)
++	require.ErrorIs(t, c.RequestKeyframe(), ErrKeyframeClosed)
++	time.Sleep(100 * time.Millisecond)
++	require.Equal(t, accepted, srv.acceptedConns())
++}
++
++func TestRequestKeyframeDoesNotBlockOnKeyframeLock(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++
++	c.kfMu.Lock()
++	result := make(chan error, 1)
++	go func() { result <- c.RequestKeyframe() }()
++
++	select {
++	case err := <-result:
++		c.kfMu.Unlock()
++		require.ErrorIs(t, err, ErrKeyframeBusy)
++	case <-time.After(50 * time.Millisecond):
++		c.kfMu.Unlock()
++		<-result
++		t.Fatal("RequestKeyframe blocked on the keyframe lock")
++	}
++}
++
++// blockingConn is a net.Conn whose first Close blocks until released,
++// like a *tls.Conn sending close_notify to a peer that does not read.
++type blockingConn struct {
++	net.Conn
++	entered chan struct{}
++	release chan struct{}
++	once    sync.Once
++}
++
++func (b *blockingConn) Close() error {
++	b.once.Do(func() {
++		close(b.entered)
++		<-b.release
++	})
++	return nil
++}
++
++func TestStopKeyframeClosesOutsideLock(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newPlayingConn(t, srv)
++
++	raw := &blockingConn{entered: make(chan struct{}), release: make(chan struct{})}
++	t.Cleanup(func() { close(raw.release) })
++
++	c.kfMu.Lock()
++	c.kfRaw = raw
++	c.kfMu.Unlock()
++
++	go c.stopKeyframe()
++	select {
++	case <-raw.entered:
++	case <-time.After(time.Second):
++		t.Fatal("stopKeyframe did not close the helper connection")
++	}
++
++	// Close is still blocked: a request must neither wait nor see the lock taken
++	result := make(chan error, 1)
++	go func() { result <- c.RequestKeyframe() }()
++	select {
++	case err := <-result:
++		require.ErrorIs(t, err, ErrKeyframeClosed)
++	case <-time.After(50 * time.Millisecond):
++		t.Fatal("RequestKeyframe blocked while the helper connection was closing")
++	}
++}
++
++// stopDeadline is how fast Stop must end a helper session that is still in
++// its dial phase. The dial timeout in these tests is several seconds, so a
++// helper that only ends by its timeout fails clearly.
++const stopDeadline = 200 * time.Millisecond
++
++// assertStopEndsDialingHelper points the helper session at uri, waits until
++// it is in its dial phase, stops the connection and checks that the helper
++// ends within stopDeadline instead of the dial timeout.
++func assertStopEndsDialingHelper(t *testing.T, srv *fakeRTSPServer, c *Conn, uri string, dialing <-chan struct{}) {
++	t.Helper()
++	res := watchKeyframe(c)
++
++	c.stateMu.Lock()
++	c.uri = uri
++	c.stateMu.Unlock()
++
++	require.NoError(t, c.RequestKeyframe())
++	select {
++	case <-dialing:
++	case <-time.After(time.Second):
++		t.Fatal("helper did not reach its dial phase")
++	}
++
++	endPlaying(t, c)
++	stopped := time.Now()
++	_ = c.Stop()
++
++	var err error
++	select {
++	case err = <-res.ch:
++	case <-time.After(stopDeadline):
++		t.Fatalf("helper in dial phase still running %v after Stop", stopDeadline)
++	}
++	t.Logf("helper ended %v after Stop", time.Since(stopped))
++	assertNoLeak(t, srv, err)
++	require.Contains(t, err.Error(), "dial: closed")
++	waitKeyframeHelpers(t, c)
++
++	c.kfMu.Lock()
++	busy, cancel := c.kfBusy, c.kfCancel
++	c.kfMu.Unlock()
++	require.False(t, busy)
++	require.Nil(t, cancel)
++	require.ErrorIs(t, c.RequestKeyframe(), ErrKeyframeClosed)
++}
++
++func TestStopEndsKeyframeHelperInTLSHandshake(t *testing.T) {
++	withKeyframeGlobals(t, time.Second, 2*time.Second)
++	srv := newFakeRTSPServer(t)
++	c := newSetupConn(t, srv)
++	c.Timeout = 5 // dial and handshake timeout of the helper in seconds; set before Start
++	startPlaying(t, srv, c)
++
++	// a peer that accepts TCP but never answers the TLS handshake
++	silent, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++	accepted := make(chan net.Conn, 4)
++	dialing := make(chan struct{})
++	go func() {
++		for {
++			conn, err := silent.Accept()
++			if err != nil {
++				return
++			}
++			accepted <- conn
++			close(dialing)
++		}
++	}()
++	t.Cleanup(func() { _ = silent.Close() })
++
++	assertStopEndsDialingHelper(t, srv, c,
++		"rtspx://user:pass@"+silent.Addr().String()+"/SECRETPATHTOKEN", dialing)
++
++	// the helper must have closed its socket, not just returned
++	conn := <-accepted
++	defer func() { _ = conn.Close() }()
++	_ = conn.SetReadDeadline(time.Now().Add(stopDeadline))
++	_, err = conn.Read(make([]byte, 512)) // ClientHello first, then EOF
++	for err == nil {
++		_, err = conn.Read(make([]byte, 512))
++	}
++	require.ErrorIs(t, err, io.EOF, "helper socket still open after Stop")
++}
+diff --git a/pkg/rtsp/producer.go b/pkg/rtsp/producer.go
+index 3d818b6..8c9a046 100644
+--- a/pkg/rtsp/producer.go
++++ b/pkg/rtsp/producer.go
+@@ -92,6 +92,8 @@ func (c *Conn) Start() (err error) {
+ }
+ 
+ func (c *Conn) Stop() (err error) {
++	c.stopKeyframe()
++
+ 	for _, receiver := range c.Receivers {
+ 		receiver.Close()
+ 	}
+diff --git a/pkg/tcp/content_length_test.go b/pkg/tcp/content_length_test.go
+new file mode 100644
+index 0000000..43b3756
+--- /dev/null
++++ b/pkg/tcp/content_length_test.go
+@@ -0,0 +1,52 @@
++package tcp
++
++import (
++	"bufio"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestContentLength(t *testing.T) {
++	tests := []struct {
++		name    string
++		value   string
++		body    string
++		want    string
++		wantErr bool
++	}{
++		{name: "valid", value: "4", body: "abcd", want: "abcd"},
++		{name: "zero", value: "0", want: ""},
++		{name: "negative", value: "-1", wantErr: true},
++		{name: "not a number", value: "abc", wantErr: true},
++		{name: "too large", value: strconv.Itoa(maxContentLength + 1), wantErr: true},
++		{name: "overflow", value: "99999999999999999999999", wantErr: true},
++	}
++
++	for _, tt := range tests {
++		t.Run("response/"+tt.name, func(t *testing.T) {
++			msg := "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: " + tt.value + "\r\n\r\n" + tt.body
++			res, err := ReadResponse(bufio.NewReader(strings.NewReader(msg)))
++			if tt.wantErr {
++				require.ErrorIs(t, err, errContentLength)
++				require.Nil(t, res)
++				return
++			}
++			require.NoError(t, err)
++			require.Equal(t, tt.want, string(res.Body))
++		})
++		t.Run("request/"+tt.name, func(t *testing.T) {
++			msg := "ANNOUNCE rtsp://example.invalid/x RTSP/1.0\r\nCSeq: 1\r\nContent-Length: " + tt.value + "\r\n\r\n" + tt.body
++			req, err := ReadRequest(bufio.NewReader(strings.NewReader(msg)))
++			if tt.wantErr {
++				require.ErrorIs(t, err, errContentLength)
++				require.Nil(t, req)
++				return
++			}
++			require.NoError(t, err)
++			require.Equal(t, tt.want, string(req.Body))
++		})
++	}
++}
+diff --git a/pkg/tcp/dial.go b/pkg/tcp/dial.go
+index 447d4d3..3c96d95 100644
+--- a/pkg/tcp/dial.go
++++ b/pkg/tcp/dial.go
+@@ -1,6 +1,7 @@
+ package tcp
+ 
+ import (
++	"context"
+ 	"crypto/tls"
+ 	"errors"
+ 	"net"
+@@ -11,6 +12,12 @@ import (
+ 
+ // Dial - for RTSP(S|X) and RTMP(S|X)
+ func Dial(u *url.URL, timeout time.Duration) (net.Conn, error) {
++	return DialContext(context.Background(), u, timeout)
++}
++
++// DialContext is Dial with a context: cancelling ctx aborts the TCP connect
++// and the TLS handshake at once, the timeout still applies to both.
++func DialContext(ctx context.Context, u *url.URL, timeout time.Duration) (net.Conn, error) {
+ 	var address string
+ 	var hostname string // without port
+ 	if i := strings.IndexByte(u.Host, ':'); i > 0 {
+@@ -42,7 +49,8 @@ func Dial(u *url.URL, timeout time.Duration) (net.Conn, error) {
+ 		return nil, errors.New("unsupported scheme: " + u.Scheme)
+ 	}
+ 
+-	conn, err := net.DialTimeout("tcp", address, timeout)
++	dialer := net.Dialer{Timeout: timeout}
++	conn, err := dialer.DialContext(ctx, "tcp", address)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -51,11 +59,20 @@ func Dial(u *url.URL, timeout time.Duration) (net.Conn, error) {
+ 		return conn, nil
+ 	}
+ 
++	// bound the handshake by the same timeout as the TCP connect,
++	// otherwise a peer that accepts but never speaks TLS blocks forever
++	if timeout > 0 {
++		_ = conn.SetDeadline(time.Now().Add(timeout))
++	}
++
+ 	tlsConn := tls.Client(conn, secure)
+-	if err = tlsConn.Handshake(); err != nil {
++	if err = tlsConn.HandshakeContext(ctx); err != nil {
++		_ = conn.Close()
+ 		return nil, err
+ 	}
+ 
++	_ = conn.SetDeadline(time.Time{})
++
+ 	if u.Scheme[4] == 'x' {
+ 		u.Scheme = u.Scheme[:4] + "s"
+ 	}
+diff --git a/pkg/tcp/dial_test.go b/pkg/tcp/dial_test.go
+new file mode 100644
+index 0000000..73ae9c0
+--- /dev/null
++++ b/pkg/tcp/dial_test.go
+@@ -0,0 +1,111 @@
++package tcp
++
++import (
++	"context"
++	"net"
++	"net/url"
++	"os"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// silentServer accepts TCP connections and never sends a byte,
++// so a TLS client handshake against it never completes on its own.
++func silentServer(t *testing.T) string {
++	t.Helper()
++
++	ln, err := net.Listen("tcp", "127.0.0.1:0")
++	require.NoError(t, err)
++
++	var mu sync.Mutex
++	var conns []net.Conn
++	done := make(chan struct{})
++
++	go func() {
++		defer close(done)
++		for {
++			conn, err := ln.Accept()
++			if err != nil {
++				return
++			}
++			mu.Lock()
++			conns = append(conns, conn)
++			mu.Unlock()
++		}
++	}()
++
++	t.Cleanup(func() {
++		_ = ln.Close()
++		<-done
++		mu.Lock()
++		for _, conn := range conns {
++			_ = conn.Close() // also ends a client handshake that has no deadline
++		}
++		mu.Unlock()
++	})
++
++	return ln.Addr().String()
++}
++
++func TestDialTLSHandshakeTimeout(t *testing.T) {
++	for _, scheme := range []string{"rtspx", "rtsps"} {
++		t.Run(scheme, func(t *testing.T) {
++			u, err := url.Parse(scheme + "://" + silentServer(t) + "/stream")
++			require.NoError(t, err)
++
++			const timeout = 200 * time.Millisecond
++
++			type result struct {
++				conn net.Conn
++				err  error
++				took time.Duration
++			}
++			ch := make(chan result, 1)
++			go func() {
++				start := time.Now()
++				conn, err := Dial(u, timeout)
++				ch <- result{conn, err, time.Since(start)}
++			}()
++
++			select {
++			case res := <-ch:
++				require.Nil(t, res.conn)
++				require.ErrorIs(t, res.err, os.ErrDeadlineExceeded)
++				require.Less(t, res.took, timeout+500*time.Millisecond)
++			case <-time.After(2 * time.Second):
++				t.Fatal("TLS handshake is not bounded by the dial timeout")
++			}
++		})
++	}
++}
++
++func TestDialContextCancelAbortsTLSHandshake(t *testing.T) {
++	u, err := url.Parse("rtspx://" + silentServer(t) + "/stream")
++	require.NoError(t, err)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	time.AfterFunc(100*time.Millisecond, cancel)
++
++	start := time.Now()
++	conn, err := DialContext(ctx, u, 5*time.Second)
++	took := time.Since(start)
++
++	require.Nil(t, conn)
++	require.ErrorIs(t, err, context.Canceled)
++	require.Less(t, took, time.Second, "handshake not aborted by the context")
++}
++
++func TestDialContextCancelled(t *testing.T) {
++	u, err := url.Parse("rtsp://" + silentServer(t) + "/stream")
++	require.NoError(t, err)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	conn, err := DialContext(ctx, u, 5*time.Second)
++	require.Nil(t, conn)
++	require.ErrorIs(t, err, context.Canceled)
++}
+diff --git a/pkg/tcp/textproto.go b/pkg/tcp/textproto.go
+index c629015..9914c5b 100644
+--- a/pkg/tcp/textproto.go
++++ b/pkg/tcp/textproto.go
+@@ -73,7 +73,9 @@ func ReadResponse(r *bufio.Reader) (*Response, error) {
+ 
+ 	if val := res.Header.Get("Content-Length"); val != "" {
+ 		var i int
+-		i, err = strconv.Atoi(val)
++		if i, err = parseContentLength(val); err != nil {
++			return nil, err
++		}
+ 		res.Body = make([]byte, i)
+ 		if _, err = io.ReadAtLeast(r, res.Body, i); err != nil {
+ 			return nil, err
+@@ -139,7 +141,9 @@ func ReadRequest(r *bufio.Reader) (*Request, error) {
+ 
+ 	if val := req.Header.Get("Content-Length"); val != "" {
+ 		var i int
+-		i, err = strconv.Atoi(val)
++		if i, err = parseContentLength(val); err != nil {
++			return nil, err
++		}
+ 		req.Body = make([]byte, i)
+ 		if _, err = io.ReadAtLeast(r, req.Body, i); err != nil {
+ 			return nil, err
+@@ -148,3 +152,19 @@ func ReadRequest(r *bufio.Reader) (*Request, error) {
+ 
+ 	return req, nil
+ }
++
++// maxContentLength caps the body of one RTSP message. The largest bodies
++// here are SDP descriptions and parameter replies of a few KiB; 16 MiB leaves
++// plenty of room for unusual cameras while a peer can no longer make the
++// process allocate gigabytes (or panic on a negative length) with one header.
++const maxContentLength = 16 << 20
++
++var errContentLength = errors.New("tcp: invalid Content-Length")
++
++func parseContentLength(val string) (int, error) {
++	i, err := strconv.Atoi(val)
++	if err != nil || i < 0 || i > maxContentLength {
++		return 0, errContentLength
++	}
++	return i, nil
++}
+diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
+index f938a3f..3555f7a 100644
+--- a/pkg/webrtc/conn.go
++++ b/pkg/webrtc/conn.go
+@@ -24,6 +24,11 @@ type Conn struct {
+ 	offer    string
+ 	closed   core.Waiter
+ 	rtcpOnce sync.Once
++
++	// keyframeMu guards keyframeHandlers only; never hold it across I/O or a
++	// handler call.
++	keyframeMu       sync.Mutex
++	keyframeHandlers map[string]func() // by MID, see OnKeyframeRequest
+ }
+ 
+ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -139,16 +144,10 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			// Pion's NACK responder runs while RTCP is read. Without this,
+ 			// receivers request missing RTP packets but never receive repairs.
+ 			// Start only once; an ICE transition must not add competing readers.
++			// The same loop reports PLI/FIR to OnKeyframeRequest handlers.
+ 			c.rtcpOnce.Do(func() {
+ 				for _, sender := range pc.GetSenders() {
+-					go func(sender *webrtc.RTPSender) {
+-						buf := make([]byte, 1500)
+-						for {
+-							if _, _, err := sender.Read(buf); err != nil {
+-								return
+-							}
+-						}
+-					}(sender)
++					go c.readSenderRTCP(sender)
+ 				}
+ 			})
+ 			for _, sender := range c.Senders {
+diff --git a/pkg/webrtc/keyframe.go b/pkg/webrtc/keyframe.go
+new file mode 100644
+index 0000000..40e15ca
+--- /dev/null
++++ b/pkg/webrtc/keyframe.go
+@@ -0,0 +1,136 @@
++package webrtc
++
++import (
++	"errors"
++	"io"
++	"net"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/interceptor"
++	"github.com/pion/rtcp"
++	"github.com/pion/webrtc/v4"
++)
++
++// maxRTCPReadErrors ends an RTCP read loop after this many consecutive failed
++// reads without a successful one in between. A single unparsable packet from
++// a viewer must not stop NACK and PLI handling; a reader that only fails must
++// not spin forever. A viewer that sends only garbage ends the loop of its own
++// senders only; the loops of other viewers are not affected.
++const maxRTCPReadErrors = 64
++
++var _ core.KeyframeRequestSource = (*Conn)(nil)
++
++// OnKeyframeRequest registers handler for RTCP PLI/FIR feedback that viewers
++// send for the sender of media (matched by media.ID, the MID). A later call
++// for the same media replaces the handler, a nil handler removes it.
++//
++// The handler runs in the RTCP read loop of that sender and must return
++// immediately. Blocking delays NACK handling for the viewer.
++func (c *Conn) OnKeyframeRequest(media *core.Media, handler func()) {
++	c.keyframeMu.Lock()
++	defer c.keyframeMu.Unlock()
++	if handler == nil {
++		delete(c.keyframeHandlers, media.ID)
++		return
++	}
++	if c.keyframeHandlers == nil {
++		c.keyframeHandlers = map[string]func(){}
++	}
++	c.keyframeHandlers[media.ID] = handler
++}
++
++// keyframeHandler returns the handler for mid, or nil.
++func (c *Conn) keyframeHandler(mid string) func() {
++	c.keyframeMu.Lock()
++	defer c.keyframeMu.Unlock()
++	return c.keyframeHandlers[mid]
++}
++
++// senderMid returns the MID of the transceiver that owns sender, or "".
++func (c *Conn) senderMid(sender *webrtc.RTPSender) string {
++	for _, tr := range c.pc.GetTransceivers() {
++		if tr.Sender() == sender {
++			return tr.Mid()
++		}
++	}
++	return ""
++}
++
++// readSenderRTCP keeps pion's interceptors (NACK limiter and responder) running
++// for sender and reports PLI/FIR to the handler registered for its MID.
++func (c *Conn) readSenderRTCP(sender *webrtc.RTPSender) {
++	readMidRTCP(c.senderMid(sender), sender.Read, c.keyframeHandler)
++}
++
++// readMidRTCP runs readRTCP for the sender with MID mid and logs at debug
++// level when the loop gives up on its error budget. The log carries only the
++// MID and the count: the read error may contain the viewer's address.
++func readMidRTCP(mid string, read func(b []byte) (int, interceptor.Attributes, error), handlerFor func(mid string) func()) {
++	gaveUp := readRTCP(read, func() {
++		if handler := handlerFor(mid); handler != nil {
++			handler()
++		}
++	})
++	if gaveUp {
++		log.Debug().Str("mid", mid).
++			Msgf("[webrtc] RTCP read loop stopped after %d consecutive errors", maxRTCPReadErrors)
++	}
++}
++
++// wantsKeyframe reports whether pkts contain a keyframe request (PLI or FIR).
++func wantsKeyframe(pkts []rtcp.Packet) bool {
++	for _, pkt := range pkts {
++		switch pkt.(type) {
++		case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
++			return true
++		}
++	}
++	return false
++}
++
++// rtcpReadDone reports whether err means the RTCP reader is closed for good.
++// pion returns io.ErrClosedPipe after the sender stopped (rtpsender.go Read)
++// and io.EOF or net.ErrClosed when the SRTCP stream is closed.
++func rtcpReadDone(err error) bool {
++	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed)
++}
++
++// readRTCP reads RTCP until the reader is closed (rtcpReadDone) or after
++// maxRTCPReadErrors consecutive errors. Packets are taken from the attribute
++// cache the interceptors share, so a PLI next to a NACK the limiter emptied is
++// seen even if the raw bytes could not be rebuilt. onKeyframe is called once
++// per read that contains PLI or FIR; it runs in this loop and must return
++// immediately. It reports whether it stopped because of the error budget.
++//
++// sender.ReadRTCP is not used: it parses the raw bytes again and fails on the
++// whole compound if a single packet in it is invalid.
++func readRTCP(read func(b []byte) (int, interceptor.Attributes, error), onKeyframe func()) (gaveUp bool) {
++	buf := make([]byte, 1500)
++	errs := 0
++	for {
++		n, attr, err := read(buf)
++		if err != nil {
++			if rtcpReadDone(err) {
++				return false
++			}
++			if errs++; errs >= maxRTCPReadErrors {
++				return true
++			}
++			continue
++		}
++		errs = 0
++
++		var pkts []rtcp.Packet
++		if attr != nil {
++			pkts, err = attr.GetRTCPPackets(buf[:n])
++		} else {
++			pkts, err = rtcp.Unmarshal(buf[:n])
++		}
++		if err != nil {
++			continue
++		}
++		if wantsKeyframe(pkts) {
++			onKeyframe()
++		}
++	}
++}
+diff --git a/pkg/webrtc/keyframe_test.go b/pkg/webrtc/keyframe_test.go
+new file mode 100644
+index 0000000..53d1f62
+--- /dev/null
++++ b/pkg/webrtc/keyframe_test.go
+@@ -0,0 +1,301 @@
++package webrtc
++
++import (
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/interceptor"
++	"github.com/pion/rtcp"
++	"github.com/stretchr/testify/require"
++)
++
++func TestWantsKeyframe(t *testing.T) {
++	pli := &rtcp.PictureLossIndication{MediaSSRC: 1}
++	fir := &rtcp.FullIntraRequest{MediaSSRC: 1, FIR: []rtcp.FIREntry{{SSRC: 1, SequenceNumber: 1}}}
++	nack := &rtcp.TransportLayerNack{MediaSSRC: 1, Nacks: []rtcp.NackPair{{PacketID: 1}}}
++	rr := &rtcp.ReceiverReport{SSRC: 1}
++
++	tests := []struct {
++		name string
++		pkts []rtcp.Packet
++		want bool
++	}{
++		{"pli", []rtcp.Packet{pli}, true},
++		{"fir", []rtcp.Packet{fir}, true},
++		{"rr+pli", []rtcp.Packet{rr, pli}, true},
++		{"nack only", []rtcp.Packet{nack}, false},
++		{"rr only", []rtcp.Packet{rr}, false},
++		{"empty", nil, false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			require.Equal(t, tt.want, wantsKeyframe(tt.pkts))
++		})
++	}
++}
++
++func TestRTCPReadDone(t *testing.T) {
++	_, parseErr := rtcp.Unmarshal([]byte{0x00})
++	require.Error(t, parseErr)
++
++	tests := []struct {
++		name string
++		err  error
++		want bool
++	}{
++		{"eof", io.EOF, true},
++		{"closed pipe", io.ErrClosedPipe, true},
++		{"wrapped net closed", fmt.Errorf("srtcp: %w", net.ErrClosed), true},
++		{"parse error", parseErr, false},
++		{"other", errors.New("x"), false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			require.Equal(t, tt.want, rtcpReadDone(tt.err))
++		})
++	}
++}
++
++// fakeRTCPReader replays a script of reads; once the script is exhausted it
++// keeps returning tail (or io.ErrClosedPipe when tail is nil).
++type fakeRTCPReader struct {
++	steps []func(b []byte) (int, interceptor.Attributes, error)
++	tail  error
++	calls atomic.Int32
++}
++
++func (f *fakeRTCPReader) read(b []byte) (int, interceptor.Attributes, error) {
++	i := int(f.calls.Add(1)) - 1
++	if i < len(f.steps) {
++		return f.steps[i](b)
++	}
++	if f.tail != nil {
++		return 0, nil, f.tail
++	}
++	return 0, nil, io.ErrClosedPipe
++}
++
++func runReadRTCP(t *testing.T, r *fakeRTCPReader, onKeyframe func()) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() {
++		readRTCP(r.read, onKeyframe)
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("readRTCP did not return")
++	}
++}
++
++func readErr(err error) func([]byte) (int, interceptor.Attributes, error) {
++	return func([]byte) (int, interceptor.Attributes, error) { return 0, nil, err }
++}
++
++func readRaw(t *testing.T, pkts ...rtcp.Packet) func([]byte) (int, interceptor.Attributes, error) {
++	raw, err := rtcp.Marshal(pkts)
++	require.NoError(t, err)
++	return func(b []byte) (int, interceptor.Attributes, error) { return copy(b, raw), nil, nil }
++}
++
++// A single unparsable packet (the limiter returns the parse error as a read
++// error) must not end the loop; a PLI in the next read is still reported.
++func TestReadRTCPContinuesAfterError(t *testing.T) {
++	_, parseErr := rtcp.Unmarshal([]byte{0x00})
++	r := &fakeRTCPReader{steps: []func([]byte) (int, interceptor.Attributes, error){
++		readErr(parseErr),
++		readRaw(t, &rtcp.PictureLossIndication{MediaSSRC: 1}),
++		readErr(io.ErrClosedPipe),
++	}, tail: errors.New("read after close")}
++
++	var keyframes atomic.Int32
++	runReadRTCP(t, r, func() { keyframes.Add(1) })
++	require.EqualValues(t, 1, keyframes.Load())
++	require.EqualValues(t, 3, r.calls.Load(), "loop must stop at io.ErrClosedPipe")
++}
++
++// Only errors without progress end the loop, after exactly maxRTCPReadErrors
++// consecutive reads; a successful read in between resets the count.
++func TestReadRTCPStopsAfterConsecutiveErrors(t *testing.T) {
++	parse := errors.New("rtcp: invalid packet length")
++
++	t.Run("errors only", func(t *testing.T) {
++		r := &fakeRTCPReader{tail: parse}
++		runReadRTCP(t, r, func() {})
++		require.EqualValues(t, maxRTCPReadErrors, r.calls.Load())
++	})
++
++	t.Run("success resets", func(t *testing.T) {
++		var steps []func([]byte) (int, interceptor.Attributes, error)
++		for i := 0; i < maxRTCPReadErrors-1; i++ {
++			steps = append(steps, readErr(parse))
++		}
++		steps = append(steps, readRaw(t, &rtcp.ReceiverReport{SSRC: 1}))
++		r := &fakeRTCPReader{steps: steps, tail: parse}
++		runReadRTCP(t, r, func() {})
++		require.EqualValues(t, 2*maxRTCPReadErrors, r.calls.Load())
++	})
++}
++
++// videoSender returns MID and SSRC of the go2rtc video sender.
++func (p *loopbackPeers) videoSender(t *testing.T) (string, uint32) {
++	t.Helper()
++	for _, tr := range p.pc.GetTransceivers() {
++		if s := tr.Sender(); s != nil && s.Track() == p.track {
++			return tr.Mid(), uint32(s.GetParameters().Encodings[0].SSRC)
++		}
++	}
++	t.Fatal("video sender not found")
++	return "", 0
++}
++
++// countingHandler returns a handler and a channel that receives one value per call.
++func countingHandler() (func(), chan struct{}) {
++	calls := make(chan struct{}, 16)
++	return func() { calls <- struct{}{} }, calls
++}
++
++func requireCalledOnce(t *testing.T, calls chan struct{}) {
++	t.Helper()
++	select {
++	case <-calls:
++	case <-time.After(2 * time.Second):
++		t.Fatal("keyframe handler not called")
++	}
++	select {
++	case <-calls:
++		t.Fatal("keyframe handler called more than once")
++	case <-time.After(300 * time.Millisecond):
++	}
++}
++
++func requireNotCalled(t *testing.T, calls chan struct{}) {
++	t.Helper()
++	select {
++	case <-calls:
++		t.Fatal("keyframe handler called unexpectedly")
++	case <-time.After(500 * time.Millisecond):
++	}
++}
++
++func TestConnInvokesKeyframeHandlerOnPLI(t *testing.T) {
++	p := newLoopbackPeers(t)
++	mid, ssrc := p.videoSender(t)
++	handler, calls := countingHandler()
++	p.conn.OnKeyframeRequest(&core.Media{ID: mid}, handler)
++
++	require.NoError(t, p.remote.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: 1, MediaSSRC: ssrc}}))
++	requireCalledOnce(t, calls)
++}
++
++func TestConnInvokesKeyframeHandlerOnFIR(t *testing.T) {
++	p := newLoopbackPeers(t)
++	mid, ssrc := p.videoSender(t)
++	handler, calls := countingHandler()
++	p.conn.OnKeyframeRequest(&core.Media{ID: mid}, handler)
++
++	require.NoError(t, p.remote.WriteRTCP([]rtcp.Packet{&rtcp.FullIntraRequest{
++		SenderSSRC: 1, MediaSSRC: ssrc, FIR: []rtcp.FIREntry{{SSRC: ssrc, SequenceNumber: 1}},
++	}}))
++	requireCalledOnce(t, calls)
++}
++
++// A compound [NACK for a foreign SSRC, PLI] passes the NACK limiter, which
++// empties the NACK. The PLI must still be reported. Driven through the real
++// limiter and readRTCP without a loopback: pion/srtp v3.1.3 splits a compound
++// per destination SSRC (session_srtcp.go decrypt), so over a real connection a
++// sender's read never carries the foreign NACK (see the loopback test below).
++func TestReadRTCPKeyframeAfterFilteredNack(t *testing.T) {
++	compound, err := rtcp.Marshal([]rtcp.Packet{
++		&rtcp.TransportLayerNack{SenderSSRC: 1, MediaSSRC: 0xdeadbeef, Nacks: []rtcp.NackPair{{PacketID: 1}}},
++		&rtcp.PictureLossIndication{SenderSSRC: 1, MediaSSRC: 0x1234},
++	})
++	require.NoError(t, err)
++
++	f := newNackLimiter(nackMaxResendBytesPerSec, nackMaxResendsPerSeq)
++	i, err := f.NewInterceptor("")
++	require.NoError(t, err)
++	var reads atomic.Int32
++	reader := i.BindRTCPReader(interceptor.RTCPReaderFunc(
++		func(b []byte, a interceptor.Attributes) (int, interceptor.Attributes, error) {
++			if reads.Add(1) > 1 {
++				return 0, nil, io.ErrClosedPipe
++			}
++			return copy(b, compound), a, nil
++		},
++	))
++
++	var keyframes atomic.Int32
++	done := make(chan struct{})
++	go func() {
++		readRTCP(func(b []byte) (int, interceptor.Attributes, error) { return reader.Read(b, nil) },
++			func() { keyframes.Add(1) })
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(2 * time.Second):
++		t.Fatal("readRTCP did not return")
++	}
++	require.EqualValues(t, 1, keyframes.Load())
++}
++
++// End-to-end over loopback: a compound with a NACK for a foreign SSRC and a
++// PLI is sent; the PLI must reach the handler. Over a real connection srtp
++// delivers the two packets separately, so this does not exercise the limiter
++// emptying a NACK next to a PLI; TestReadRTCPKeyframeAfterFilteredNack does.
++func TestConnKeyframeLoopbackCompoundWithForeignNack(t *testing.T) {
++	p := newLoopbackPeers(t)
++	mid, ssrc := p.videoSender(t)
++	handler, calls := countingHandler()
++	p.conn.OnKeyframeRequest(&core.Media{ID: mid}, handler)
++
++	require.NoError(t, p.remote.WriteRTCP([]rtcp.Packet{
++		&rtcp.TransportLayerNack{SenderSSRC: 1, MediaSSRC: 0xdeadbeef, Nacks: []rtcp.NackPair{{PacketID: 1}}},
++		&rtcp.PictureLossIndication{SenderSSRC: 1, MediaSSRC: ssrc},
++	}))
++	requireCalledOnce(t, calls)
++}
++
++// A NACK alone is no keyframe request. The PLI afterwards proves the loop and
++// the handler were live during the silent phase.
++func TestConnNackDoesNotInvokeKeyframeHandler(t *testing.T) {
++	p := newLoopbackPeers(t)
++	mid, ssrc := p.videoSender(t)
++	handler, calls := countingHandler()
++	p.conn.OnKeyframeRequest(&core.Media{ID: mid}, handler)
++
++	require.NoError(t, p.remote.WriteRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
++		SenderSSRC: 1, MediaSSRC: ssrc, Nacks: []rtcp.NackPair{{PacketID: 1}},
++	}}))
++	requireNotCalled(t, calls)
++
++	require.NoError(t, p.remote.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: 1, MediaSSRC: ssrc}}))
++	requireCalledOnce(t, calls)
++}
++
++// A handler registered for another MID must not see a PLI on the video
++// sender. Registering the right MID afterwards proves the PLI path works.
++func TestConnKeyframeHandlerOtherMid(t *testing.T) {
++	p := newLoopbackPeers(t)
++	mid, ssrc := p.videoSender(t)
++	other, otherCalls := countingHandler()
++	p.conn.OnKeyframeRequest(&core.Media{ID: mid + "-other"}, other)
++
++	pli := []rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: 1, MediaSSRC: ssrc}}
++	require.NoError(t, p.remote.WriteRTCP(pli))
++	requireNotCalled(t, otherCalls)
++
++	handler, calls := countingHandler()
++	p.conn.OnKeyframeRequest(&core.Media{ID: mid}, handler)
++	require.NoError(t, p.remote.WriteRTCP(pli))
++	requireCalledOnce(t, calls)
++	requireNotCalled(t, otherCalls)
++}
+diff --git a/pkg/webrtc/log.go b/pkg/webrtc/log.go
+new file mode 100644
+index 0000000..1090b1f
+--- /dev/null
++++ b/pkg/webrtc/log.go
+@@ -0,0 +1,10 @@
++package webrtc
++
++import "github.com/rs/zerolog"
++
++var log = zerolog.Nop()
++
++// SetLogger sets the logger for debug messages of this package.
++func SetLogger(logger zerolog.Logger) {
++	log = logger
++}
+diff --git a/pkg/webrtc/nack_limit_test.go b/pkg/webrtc/nack_limit_test.go
+index e183427..a35bf70 100644
+--- a/pkg/webrtc/nack_limit_test.go
++++ b/pkg/webrtc/nack_limit_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"testing"
+ 	"time"
+ 
++	"github.com/pion/interceptor"
+ 	"github.com/pion/rtcp"
+ 	"github.com/pion/rtp"
+ 	pion "github.com/pion/webrtc/v4"
+@@ -208,3 +209,69 @@ func TestNackLimiterWindowBudgetFitsAllArchs(t *testing.T) {
+ 	l := i.(*nackLimiter)
+ 	require.EqualValues(t, nackMaxResendBytesPerSec/2, l.maxWindowBytes)
+ }
++
++// A NACK the limiter empties completely (here: foreign SSRC) must not be
++// re-marshalled as a header without FCI. rtcp.Unmarshal rejects such a packet,
++// so any consumer of the raw bytes would lose the whole compound, including a
++// PLI next to it. The cached packets keep the emptied NACK for the responder.
++func TestNackLimiterRawBytesStayParsable(t *testing.T) {
++	compound, err := rtcp.Marshal([]rtcp.Packet{
++		&rtcp.TransportLayerNack{SenderSSRC: 1, MediaSSRC: 0xdeadbeef, Nacks: []rtcp.NackPair{{PacketID: 7}}},
++		&rtcp.PictureLossIndication{SenderSSRC: 1, MediaSSRC: 0x1234},
++	})
++	require.NoError(t, err)
++
++	f := newNackLimiter(nackMaxResendBytesPerSec, nackMaxResendsPerSeq)
++	i, err := f.NewInterceptor("")
++	require.NoError(t, err)
++	reader := i.BindRTCPReader(interceptor.RTCPReaderFunc(
++		func(b []byte, a interceptor.Attributes) (int, interceptor.Attributes, error) {
++			return copy(b, compound), a, nil
++		},
++	))
++
++	buf := make([]byte, 1500)
++	n, attr, err := reader.Read(buf, nil)
++	require.NoError(t, err)
++
++	raw, err := rtcp.Unmarshal(buf[:n])
++	require.NoError(t, err, "re-marshalled RTCP must stay parsable")
++	require.Len(t, raw, 1)
++	pli, ok := raw[0].(*rtcp.PictureLossIndication)
++	require.True(t, ok, "raw bytes must carry the PLI, got %T", raw[0])
++	require.EqualValues(t, 0x1234, pli.MediaSSRC)
++
++	cached, err := attr.GetRTCPPackets(buf[:n])
++	require.NoError(t, err)
++	require.Len(t, cached, 2, "the responder still sees the emptied NACK")
++	nack, ok := cached[0].(*rtcp.TransportLayerNack)
++	require.True(t, ok)
++	require.Empty(t, nack.Nacks)
++}
++
++// If the limiter empties every packet of a read, no raw bytes are left; the
++// cache still carries the emptied NACK.
++func TestNackLimiterRawBytesEmptyWhenAllNacksEmptied(t *testing.T) {
++	compound, err := rtcp.Marshal([]rtcp.Packet{
++		&rtcp.TransportLayerNack{SenderSSRC: 1, MediaSSRC: 0xdeadbeef, Nacks: []rtcp.NackPair{{PacketID: 7}}},
++	})
++	require.NoError(t, err)
++
++	f := newNackLimiter(nackMaxResendBytesPerSec, nackMaxResendsPerSeq)
++	i, err := f.NewInterceptor("")
++	require.NoError(t, err)
++	reader := i.BindRTCPReader(interceptor.RTCPReaderFunc(
++		func(b []byte, a interceptor.Attributes) (int, interceptor.Attributes, error) {
++			return copy(b, compound), a, nil
++		},
++	))
++
++	buf := make([]byte, 1500)
++	n, attr, err := reader.Read(buf, nil)
++	require.NoError(t, err)
++	require.Zero(t, n)
++
++	cached, err := attr.GetRTCPPackets(buf[:n])
++	require.NoError(t, err)
++	require.Len(t, cached, 1)
++}
+diff --git a/pkg/webrtc/nack_limiter.go b/pkg/webrtc/nack_limiter.go
+index 5a83ddd..e38258b 100644
+--- a/pkg/webrtc/nack_limiter.go
++++ b/pkg/webrtc/nack_limiter.go
+@@ -176,7 +176,7 @@ func (l *nackLimiter) BindRTCPReader(reader interceptor.RTCPReader) interceptor.
+ 		// The responder reads the (now filtered) cached packets; keep the raw
+ 		// bytes consistent for any other consumer.
+ 		if changed {
+-			if raw, err := rtcp.Marshal(pkts); err == nil && len(raw) <= len(b) {
++			if raw, err := marshalWithoutEmptyNacks(pkts); err == nil && len(raw) <= len(b) {
+ 				n = copy(b, raw)
+ 			}
+ 		}
+@@ -184,6 +184,22 @@ func (l *nackLimiter) BindRTCPReader(reader interceptor.RTCPReader) interceptor.
+ 	})
+ }
+ 
++// marshalWithoutEmptyNacks marshals pkts but skips NACKs the limiter emptied.
++// A NACK without FCI is invalid (RFC 4585 6.2.1) and rtcp.Unmarshal rejects
++// it together with the rest of the compound, e.g. a PLI next to it. The
++// cached slice is left as is, so the responder still sees the emptied NACK.
++// If every packet is skipped, rtcp.Marshal returns no bytes.
++func marshalWithoutEmptyNacks(pkts []rtcp.Packet) ([]byte, error) {
++	keep := make([]rtcp.Packet, 0, len(pkts))
++	for _, pkt := range pkts {
++		if nack, ok := pkt.(*rtcp.TransportLayerNack); ok && len(nack.Nacks) == 0 {
++			continue
++		}
++		keep = append(keep, pkt)
++	}
++	return rtcp.Marshal(keep)
++}
++
+ // filter rewrites nack.Nacks to the sequence numbers allowed by the budget.
+ // It reports whether anything was removed.
+ func (l *nackLimiter) filter(nack *rtcp.TransportLayerNack) bool {
+diff --git a/pkg/webrtc/nack_test.go b/pkg/webrtc/nack_test.go
+index bf35507..abe96df 100644
+--- a/pkg/webrtc/nack_test.go
++++ b/pkg/webrtc/nack_test.go
+@@ -10,10 +10,25 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
+-// Exercise the actual connection lifecycle and Pion NACK responder over local ICE.
+-// The test receiver accepts a duplicate only so we can verify a requested repair
+-// without relying on random packet loss. Production replay protection is unchanged.
+-func TestConnectionRetransmitsNack(t *testing.T) {
++// loopbackPeers is a go2rtc server connection (production API, production
++// interceptors) with one video sender, connected over local ICE to a plain
++// pion receiver. Every RTP packet the receiver reads lands in packets.
++type loopbackPeers struct {
++	conn    *Conn
++	pc      *pion.PeerConnection
++	remote  *pion.PeerConnection
++	track   *Track
++	packets chan *rtp.Packet
++}
++
++// newLoopbackPeers connects both sides and waits until both report
++// PeerConnectionStateConnected, so go2rtc's RTCP read loops are running and the
++// receiver can write RTCP.
++// The receiver accepts duplicates (replay protection off) so a test can see a
++// requested repair without relying on random packet loss.
++func newLoopbackPeers(t *testing.T) *loopbackPeers {
++	t.Helper()
++
+ 	api, err := NewServerAPI("", "", &Filters{Loopback: true, Networks: []string{"udp4"}})
+ 	require.NoError(t, err)
+ 	pc, err := api.NewPeerConnection(pion.Configuration{})
+@@ -30,7 +45,7 @@ func TestConnectionRetransmitsNack(t *testing.T) {
+ 	require.NoError(t, err)
+ 	t.Cleanup(func() { _ = remote.Close() })
+ 
+-	packets := make(chan *rtp.Packet, 8)
++	p := &loopbackPeers{conn: conn, pc: pc, remote: remote, packets: make(chan *rtp.Packet, 8)}
+ 	remote.OnTrack(func(track *pion.TrackRemote, _ *pion.RTPReceiver) {
+ 		for {
+ 			packet, _, readErr := track.ReadRTP()
+@@ -38,13 +53,13 @@ func TestConnectionRetransmitsNack(t *testing.T) {
+ 				return
+ 			}
+ 			select {
+-			case packets <- packet:
++			case p.packets <- packet:
+ 			default:
+ 			}
+ 		}
+ 	})
+-	track := NewTrack("video")
+-	_, err = pc.AddTrack(track)
++	p.track = NewTrack("video")
++	_, err = pc.AddTrack(p.track)
+ 	require.NoError(t, err)
+ 	_, err = pc.CreateDataChannel("test", nil)
+ 	require.NoError(t, err)
+@@ -70,22 +85,33 @@ func TestConnectionRetransmitsNack(t *testing.T) {
+ 	}
+ 	require.NoError(t, pc.SetRemoteDescription(*remote.LocalDescription()))
+ 	require.Eventually(t, func() bool { return pc.ConnectionState() == pion.PeerConnectionStateConnected }, 5*time.Second, 10*time.Millisecond)
++	// remote.WriteRTCP fails until the receiver's own DTLS transport is up.
++	require.Eventually(t, func() bool { return remote.ConnectionState() == pion.PeerConnectionStateConnected }, 5*time.Second, 10*time.Millisecond)
++
++	return p
++}
++
++// Exercise the actual connection lifecycle and Pion NACK responder over local ICE.
++// The test receiver accepts a duplicate only so we can verify a requested repair
++// without relying on random packet loss. Production replay protection is unchanged.
++func TestConnectionRetransmitsNack(t *testing.T) {
++	p := newLoopbackPeers(t)
+ 
+-	require.NoError(t, track.WriteRTP(96, &rtp.Packet{
++	require.NoError(t, p.track.WriteRTP(96, &rtp.Packet{
+ 		Header: rtp.Header{Version: 2, Marker: true, Timestamp: 90000}, Payload: []byte{0x65, 0x88, 0x84},
+ 	}))
+ 	var original *rtp.Packet
+ 	select {
+-	case original = <-packets:
++	case original = <-p.packets:
+ 	case <-time.After(2 * time.Second):
+ 		t.Fatal("initial RTP missing")
+ 	}
+-	require.NoError(t, remote.WriteRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
++	require.NoError(t, p.remote.WriteRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
+ 		SenderSSRC: 1, MediaSSRC: original.SSRC,
+ 		Nacks: []rtcp.NackPair{{PacketID: original.SequenceNumber}},
+ 	}}))
+ 	select {
+-	case repaired := <-packets:
++	case repaired := <-p.packets:
+ 		require.Equal(t, original.SequenceNumber, repaired.SequenceNumber)
+ 		require.Equal(t, original.Timestamp, repaired.Timestamp)
+ 		require.Equal(t, original.Payload, repaired.Payload)
+diff --git a/pkg/webrtc/rtcp_log_test.go b/pkg/webrtc/rtcp_log_test.go
+new file mode 100644
+index 0000000..19f8af1
+--- /dev/null
++++ b/pkg/webrtc/rtcp_log_test.go
+@@ -0,0 +1,50 @@
++package webrtc
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"testing"
++
++	"github.com/pion/interceptor"
++	"github.com/rs/zerolog"
++	"github.com/stretchr/testify/require"
++)
++
++// withLogBuffer routes the package logger into a buffer for one test.
++func withLogBuffer(t *testing.T) *bytes.Buffer {
++	t.Helper()
++	var buf bytes.Buffer
++	old := log
++	SetLogger(zerolog.New(&buf).Level(zerolog.DebugLevel))
++	t.Cleanup(func() { log = old })
++	return &buf
++}
++
++func TestReadMidRTCPLogsErrorBudget(t *testing.T) {
++	buf := withLogBuffer(t)
++
++	// the error text could carry an address; it must not reach the log
++	failing := func(b []byte) (int, interceptor.Attributes, error) {
++		return 0, nil, errors.New("read udp 192.0.2.1:5000: SECRET")
++	}
++	readMidRTCP("0", failing, func(string) func() { return nil })
++
++	out := buf.String()
++	require.Contains(t, out, `"level":"debug"`)
++	require.Contains(t, out, `"mid":"0"`)
++	require.Contains(t, out, "64 consecutive")
++	require.NotContains(t, out, "192.0.2.1")
++	require.NotContains(t, out, "SECRET")
++}
++
++func TestReadMidRTCPSilentOnClose(t *testing.T) {
++	buf := withLogBuffer(t)
++
++	closed := func(b []byte) (int, interceptor.Attributes, error) {
++		return 0, nil, io.EOF
++	}
++	readMidRTCP("0", closed, func(string) func() { return nil })
++
++	require.Empty(t, buf.String())
++}
+-- 
+2.56.1.vfs.0.1
+

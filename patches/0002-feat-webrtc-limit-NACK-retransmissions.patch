@@ -1,0 +1,537 @@
+From a27f2ad2917555201a9a97ee52b1ee23bee93798 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bj=C3=B6rn=20Strausmann?= <projects@strausmann.ch>
+Date: Sat, 14 Nov 2026 14:22:09 +0000
+Subject: [PATCH] feat(webrtc): limit NACK retransmissions
+
+Reading RTCP (#2486) activates pion's NACK responder, which
+resends every requested packet still in its 1024-packet history. Its only
+rate brake depends on the GCC target bitrate (responder_interceptor.go:213),
+which go2rtc never registers, so one peer could make go2rtc send ~1000x its
+own NACK traffic (measured: 1.2 MB sent, ~30 MB resent during a 1 s flood).
+
+Add a NACK limiter interceptor that removes NACK entries beyond a budget
+before the responder handles them:
+- resend bytes per 500 ms window <= bytes the stream itself sent in that
+  window, clamped to [32 KiB, 1 MiB] (2 MiB/s ceiling per stream)
+- at most 5 resends per sequence number
+
+The default interceptors are now registered one by one (identical to
+webrtc.RegisterDefaultInterceptors in pion/webrtc v4.2.25 interceptor.go:33-74)
+with the limiter first. Order matters: interceptor.Chain passes incoming RTCP
+to interceptors in registry order (pion/interceptor v0.1.51 chain.go:19-25).
+Registered after the responder, the limiter only works by racing the
+responder's resend goroutine (responder_interceptor.go:115); the race
+detector reports it.
+
+Tests: flood budget, per-sequence limit; TestConnectionRetransmitsNack
+still repairs a single loss. Removing the limiter turns both new tests red.
+---
+ pkg/webrtc/api.go             |  26 +++-
+ pkg/webrtc/nack_limit_test.go | 199 ++++++++++++++++++++++++++++
+ pkg/webrtc/nack_limiter.go    | 237 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 461 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/webrtc/nack_limit_test.go
+ create mode 100644 pkg/webrtc/nack_limiter.go
+
+diff --git a/pkg/webrtc/api.go b/pkg/webrtc/api.go
+index 5551d65..3423199 100644
+--- a/pkg/webrtc/api.go
++++ b/pkg/webrtc/api.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/AlexxIT/go2rtc/pkg/xnet"
+ 	"github.com/pion/ice/v4"
+ 	"github.com/pion/interceptor"
++	"github.com/pion/interceptor/pkg/nack"
+ 	"github.com/pion/webrtc/v4"
+ )
+ 
+@@ -92,6 +93,29 @@ func (f *Filters) IPFilter(ip net.IP) bool {
+ 	return f == nil || f.IPs == nil || core.Contains(f.IPs, ip.String())
+ }
+ 
++// registerInterceptors is webrtc.RegisterDefaultInterceptors (pion/webrtc/v4@v4.2.25
++// interceptor.go:33-74: NACK, RTCP reports, simulcast header extensions, stats,
++// TWCC sender) with a NACK limiter in front of the NACK responder. The limiter
++// must be added first: the chain hands incoming RTCP to interceptors in
++// registry order, so a filter added after the responder would not protect it.
++func registerInterceptors(m *webrtc.MediaEngine, i *interceptor.Registry) error {
++	i.Add(newNackLimiter(nackMaxResendBytesPerSec, nackMaxResendsPerSeq))
++
++	if err := webrtc.ConfigureNackWithOptions(m, i, nil, nack.ResponderSize(nackBufferSize)); err != nil {
++		return err
++	}
++	if err := webrtc.ConfigureRTCPReports(i); err != nil {
++		return err
++	}
++	if err := webrtc.ConfigureSimulcastExtensionHeaders(m); err != nil {
++		return err
++	}
++	if err := webrtc.ConfigureStatsInterceptor(i); err != nil {
++		return err
++	}
++	return webrtc.ConfigureTWCCSender(m, i)
++}
++
+ func NewServerAPI(network, address string, filters *Filters) (*webrtc.API, error) {
+ 	// for debug logs add to env: `PION_LOG_DEBUG=all`
+ 	m := &webrtc.MediaEngine{}
+@@ -103,7 +127,7 @@ func NewServerAPI(network, address string, filters *Filters) (*webrtc.API, error
+ 	}
+ 
+ 	i := &interceptor.Registry{}
+-	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
++	if err := registerInterceptors(m, i); err != nil {
+ 		return nil, err
+ 	}
+ 
+diff --git a/pkg/webrtc/nack_limit_test.go b/pkg/webrtc/nack_limit_test.go
+new file mode 100644
+index 0000000..0765783
+--- /dev/null
++++ b/pkg/webrtc/nack_limit_test.go
+@@ -0,0 +1,199 @@
++package webrtc
++
++import (
++	"slices"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/pion/rtcp"
++	"github.com/pion/rtp"
++	pion "github.com/pion/webrtc/v4"
++	"github.com/stretchr/testify/require"
++)
++
++// nackPeer is a go2rtc server connection (production API, production
++// interceptors) plus a plain pion receiver that counts every RTP packet per
++// sequence number. A sequence number seen more than once was retransmitted.
++type nackPeer struct {
++	track  *Track
++	remote *pion.PeerConnection
++	ssrc   uint32
++
++	mu       sync.Mutex
++	received map[uint16]int
++	bytes    map[uint16]int
++}
++
++func newNackPeer(t *testing.T) *nackPeer {
++	t.Helper()
++
++	api, err := NewServerAPI("", "", &Filters{Loopback: true, Networks: []string{"udp4"}})
++	require.NoError(t, err)
++	pc, err := api.NewPeerConnection(pion.Configuration{})
++	require.NoError(t, err)
++	conn := NewConn(pc)
++	t.Cleanup(func() { _ = conn.Close() })
++
++	settings := pion.SettingEngine{}
++	settings.SetIncludeLoopbackCandidate(true)
++	settings.SetNetworkTypes([]pion.NetworkType{pion.NetworkTypeUDP4})
++	// Retransmissions reuse the original sequence number; let them through so
++	// they can be counted.
++	settings.DisableSRTPReplayProtection(true)
++	remote, err := pion.NewAPI(pion.WithSettingEngine(settings)).NewPeerConnection(pion.Configuration{})
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = remote.Close() })
++
++	p := &nackPeer{remote: remote, received: map[uint16]int{}, bytes: map[uint16]int{}}
++	remote.OnTrack(func(track *pion.TrackRemote, _ *pion.RTPReceiver) {
++		buf := make([]byte, 1500)
++		for {
++			n, _, readErr := track.Read(buf)
++			if readErr != nil {
++				return
++			}
++			var packet rtp.Packet
++			if packet.Unmarshal(buf[:n]) != nil {
++				continue
++			}
++			p.mu.Lock()
++			p.received[packet.SequenceNumber]++
++			p.bytes[packet.SequenceNumber] = n
++			p.ssrc = packet.SSRC
++			p.mu.Unlock()
++		}
++	})
++
++	p.track = NewTrack("video")
++	_, err = pc.AddTrack(p.track)
++	require.NoError(t, err)
++	_, err = pc.CreateDataChannel("test", nil)
++	require.NoError(t, err)
++
++	offer, err := pc.CreateOffer(nil)
++	require.NoError(t, err)
++	gathered := pion.GatheringCompletePromise(pc)
++	require.NoError(t, pc.SetLocalDescription(offer))
++	<-gathered
++	require.NoError(t, remote.SetRemoteDescription(*pc.LocalDescription()))
++	answer, err := remote.CreateAnswer(nil)
++	require.NoError(t, err)
++	gathered = pion.GatheringCompletePromise(remote)
++	require.NoError(t, remote.SetLocalDescription(answer))
++	<-gathered
++	require.NoError(t, pc.SetRemoteDescription(*remote.LocalDescription()))
++	require.Eventually(t, func() bool {
++		return pc.ConnectionState() == pion.PeerConnectionStateConnected
++	}, 5*time.Second, 10*time.Millisecond)
++
++	return p
++}
++
++// send writes count packets with the given payload size, paced so the
++// loopback receive buffer does not drop originals, and waits until the
++// receiver has seen all of them. Returns the sequence numbers.
++func (p *nackPeer) send(t *testing.T, count, payloadSize int) []uint16 {
++	t.Helper()
++	payload := make([]byte, payloadSize)
++	payload[0] = 0x65
++	for i := 0; i < count; i++ {
++		require.NoError(t, p.track.WriteRTP(96, &rtp.Packet{
++			Header:  rtp.Header{Version: 2, Timestamp: uint32(i) * 3000},
++			Payload: payload,
++		}))
++		if i%16 == 15 {
++			time.Sleep(4 * time.Millisecond)
++		}
++	}
++	require.Eventually(t, func() bool {
++		p.mu.Lock()
++		defer p.mu.Unlock()
++		return len(p.received) >= count*95/100
++	}, 3*time.Second, 10*time.Millisecond, "receiver did not get the original packets")
++
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	seqs := make([]uint16, 0, len(p.received))
++	for seq := range p.received {
++		seqs = append(seqs, seq)
++	}
++	// NackPairsFromSequenceNumbers expects ascending order (no wrap in these tests).
++	slices.Sort(seqs)
++	return seqs
++}
++
++func (p *nackPeer) nack(t *testing.T, seqs []uint16) {
++	t.Helper()
++	p.mu.Lock()
++	ssrc := p.ssrc
++	p.mu.Unlock()
++	require.NoError(t, p.remote.WriteRTCP([]rtcp.Packet{&rtcp.TransportLayerNack{
++		SenderSSRC: 1, MediaSSRC: ssrc, Nacks: rtcp.NackPairsFromSequenceNumbers(seqs),
++	}}))
++}
++
++// resent returns retransmitted packets and bytes (every reception beyond the first).
++func (p *nackPeer) resent() (packets, bytes int) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for seq, n := range p.received {
++		packets += n - 1
++		bytes += (n - 1) * p.bytes[seq]
++	}
++	return
++}
++
++// A peer that NACKs its whole history every 10 ms must not get more
++// retransmitted bytes than roughly what go2rtc itself sent. Without the limiter
++// the pion responder answers every NACK in full (measured ~29 MB for 1.2 MB sent).
++func TestNackFloodIsBudgeted(t *testing.T) {
++	p := newNackPeer(t)
++	seqs := p.send(t, 1024, 1200)
++
++	sentBytes := 0
++	p.mu.Lock()
++	for _, n := range p.bytes {
++		sentBytes += n
++	}
++	p.mu.Unlock()
++
++	deadline := time.Now().Add(time.Second)
++	for time.Now().Before(deadline) {
++		p.nack(t, seqs)
++		time.Sleep(10 * time.Millisecond)
++	}
++	time.Sleep(200 * time.Millisecond) // let in-flight resends arrive
++
++	resentPackets, resentBytes := p.resent()
++	t.Logf("sent %d bytes, resent %d packets / %d bytes", sentBytes, resentPackets, resentBytes)
++
++	// Budget: one window worth of own sending (capped at nackMaxResendBytesPerSec/2)
++	// while the originals are inside the window, the floor afterwards.
++	budget := sentBytes + 2*nackMinResendBytesPerWindow
++	require.LessOrEqual(t, resentBytes, budget*12/10, "retransmissions exceed the resend budget")
++	require.Positive(t, resentPackets, "flood test must still see some retransmissions")
++}
++
++// Each sequence number is retransmitted at most nackMaxResendsPerSeq times,
++// however often it is requested. Payloads are small so the byte budget
++// (floor) is not what limits here.
++func TestNackResendsPerSequenceAreLimited(t *testing.T) {
++	p := newNackPeer(t)
++	seqs := p.send(t, 10, 100)
++
++	for i := 0; i < 20; i++ {
++		p.nack(t, seqs)
++		// longer than the responder's own suppression interval (rtt + 5 ms)
++		time.Sleep(20 * time.Millisecond)
++	}
++	time.Sleep(200 * time.Millisecond)
++
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	for _, seq := range seqs {
++		resends := p.received[seq] - 1
++		require.LessOrEqual(t, resends, nackMaxResendsPerSeq, "seq %d resent too often", seq)
++		require.GreaterOrEqual(t, resends, 1, "seq %d was never repaired", seq)
++	}
++}
+diff --git a/pkg/webrtc/nack_limiter.go b/pkg/webrtc/nack_limiter.go
+new file mode 100644
+index 0000000..536b353
+--- /dev/null
++++ b/pkg/webrtc/nack_limiter.go
+@@ -0,0 +1,237 @@
++package webrtc
++
++import (
++	"sync"
++	"time"
++
++	"github.com/pion/interceptor"
++	"github.com/pion/rtcp"
++	"github.com/pion/rtp"
++)
++
++// Limits for answering NACKs (RFC 4585 generic NACK).
++//
++// pion's NACK responder resends every requested packet that is still buffered.
++// Its only rate brake reads the target bitrate set by the GCC interceptor,
++// which go2rtc does not register, so without a limit one peer can make go2rtc
++// send ~1000x its own NACK traffic (a 256-byte NACK covers the 1024 buffered
++// packets). The limiter below mirrors libwebrtc: retransmissions may use at
++// most as many bytes as the stream itself sent in the last window.
++const (
++	// nackBufferSize is the responder's per-SSRC packet history. The limiter
++	// keeps the same window so it knows which sequence numbers can be resent.
++	nackBufferSize = 1024
++
++	// nackWindow is the sliding window for both the send rate and the resend budget.
++	nackWindow = 500 * time.Millisecond
++
++	// nackMaxResendBytesPerSec caps retransmissions per stream even for
++	// high-bitrate sources (~16.8 Mbit/s, above typical camera streams).
++	nackMaxResendBytesPerSec = 2 << 20
++
++	// nackMinResendBytesPerWindow lets a quiet or low-bitrate stream still repair
++	// a short burst loss (~27 packets of 1200 bytes, ~0.5 Mbit/s).
++	nackMinResendBytesPerWindow = 32 << 10
++
++	// nackMaxResendsPerSeq bounds how often one packet is resent. Browsers give
++	// up on a packet after a few retries; more only feeds a lossy relay path.
++	nackMaxResendsPerSeq = 5
++)
++
++const nackBucketCount = 10
++
++// windowCounter sums bytes over the last nackWindow in fixed buckets.
++type windowCounter struct {
++	bytes [nackBucketCount]int
++	stamp [nackBucketCount]int64
++}
++
++func (w *windowCounter) bucket(now time.Time) int64 {
++	return now.UnixNano() / int64(nackWindow/nackBucketCount)
++}
++
++func (w *windowCounter) add(now time.Time, n int) {
++	idx := w.bucket(now)
++	slot := idx % nackBucketCount
++	if w.stamp[slot] != idx {
++		w.stamp[slot] = idx
++		w.bytes[slot] = 0
++	}
++	w.bytes[slot] += n
++}
++
++func (w *windowCounter) sum(now time.Time) (total int) {
++	idx := w.bucket(now)
++	for i := range w.bytes {
++		if idx-w.stamp[i] < nackBucketCount {
++			total += w.bytes[i]
++		}
++	}
++	return
++}
++
++type nackHistoryEntry struct {
++	seq     uint16
++	size    int
++	resends int
++	valid   bool
++}
++
++type nackLimiterStream struct {
++	history [nackBufferSize]nackHistoryEntry
++	sent    windowCounter
++	resent  windowCounter
++}
++
++// nackLimiterFactory creates a nackLimiter per PeerConnection.
++type nackLimiterFactory struct {
++	maxResendBytesPerSec int
++	maxResendsPerSeq     int
++}
++
++// newNackLimiter returns an interceptor that removes NACK entries beyond the
++// resend budget before pion's NACK responder sees them.
++//
++// It must be registered BEFORE the responder: interceptor.Chain wraps RTCP
++// readers in registry order (pion/interceptor@v0.1.51 chain.go:19-25), so the
++// first registered interceptor sits next to the transport, and the responder
++// only acts after its inner reader returned (pkg/nack/responder_interceptor.go:103-117).
++// Both share the parsed packets through Attributes.GetRTCPPackets (attributes.go:62-78).
++func newNackLimiter(maxResendBytesPerSec, maxResendsPerSeq int) interceptor.Factory {
++	return &nackLimiterFactory{maxResendBytesPerSec: maxResendBytesPerSec, maxResendsPerSeq: maxResendsPerSeq}
++}
++
++func (f *nackLimiterFactory) NewInterceptor(string) (interceptor.Interceptor, error) {
++	return &nackLimiter{
++		maxWindowBytes:   f.maxResendBytesPerSec * int(nackWindow) / int(time.Second),
++		maxResendsPerSeq: f.maxResendsPerSeq,
++		streams:          map[uint32]*nackLimiterStream{},
++		now:              time.Now,
++	}, nil
++}
++
++type nackLimiter struct {
++	interceptor.NoOp
++
++	maxWindowBytes   int
++	maxResendsPerSeq int
++	now              func() time.Time
++
++	mu      sync.Mutex
++	streams map[uint32]*nackLimiterStream
++}
++
++// BindLocalStream records size and send time of every original packet. Being
++// first in the chain it also sees the responder's retransmissions; those reuse
++// a sequence number already in the history and are not counted as sent bytes.
++func (l *nackLimiter) BindLocalStream(info *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
++	stream := &nackLimiterStream{}
++	l.mu.Lock()
++	l.streams[info.SSRC] = stream
++	l.mu.Unlock()
++
++	return interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, attr interceptor.Attributes) (int, error) {
++		size := header.MarshalSize() + len(payload)
++		l.mu.Lock()
++		entry := &stream.history[header.SequenceNumber%nackBufferSize]
++		if !entry.valid || entry.seq != header.SequenceNumber {
++			*entry = nackHistoryEntry{seq: header.SequenceNumber, size: size, valid: true}
++			stream.sent.add(l.now(), size)
++		}
++		l.mu.Unlock()
++		return writer.Write(header, payload, attr)
++	})
++}
++
++func (l *nackLimiter) UnbindLocalStream(info *interceptor.StreamInfo) {
++	l.mu.Lock()
++	delete(l.streams, info.SSRC)
++	l.mu.Unlock()
++}
++
++func (l *nackLimiter) BindRTCPReader(reader interceptor.RTCPReader) interceptor.RTCPReader {
++	return interceptor.RTCPReaderFunc(func(b []byte, a interceptor.Attributes) (int, interceptor.Attributes, error) {
++		n, attr, err := reader.Read(b, a)
++		if err != nil {
++			return n, attr, err
++		}
++		if attr == nil {
++			attr = make(interceptor.Attributes)
++		}
++		pkts, err := attr.GetRTCPPackets(b[:n])
++		if err != nil {
++			return 0, nil, err
++		}
++
++		changed := false
++		for _, pkt := range pkts {
++			if nack, ok := pkt.(*rtcp.TransportLayerNack); ok {
++				if l.filter(nack) {
++					changed = true
++				}
++			}
++		}
++
++		// The responder reads the (now filtered) cached packets; keep the raw
++		// bytes consistent for any other consumer.
++		if changed {
++			if raw, err := rtcp.Marshal(pkts); err == nil && len(raw) <= len(b) {
++				n = copy(b, raw)
++			}
++		}
++		return n, attr, nil
++	})
++}
++
++// filter rewrites nack.Nacks to the sequence numbers allowed by the budget.
++// It reports whether anything was removed.
++func (l *nackLimiter) filter(nack *rtcp.TransportLayerNack) bool {
++	now := l.now()
++
++	l.mu.Lock()
++	defer l.mu.Unlock()
++
++	stream := l.streams[nack.MediaSSRC]
++	if stream == nil {
++		if len(nack.Nacks) == 0 {
++			return false
++		}
++		nack.Nacks = nil // nothing of ours to resend
++		return true
++	}
++
++	budget := stream.sent.sum(now)
++	if budget < nackMinResendBytesPerWindow {
++		budget = nackMinResendBytesPerWindow
++	}
++	if budget > l.maxWindowBytes {
++		budget = l.maxWindowBytes
++	}
++	used := stream.resent.sum(now)
++
++	var allowed []uint16
++	requested := 0
++	for i := range nack.Nacks {
++		nack.Nacks[i].Range(func(seq uint16) bool {
++			requested++
++			entry := &stream.history[seq%nackBufferSize]
++			if !entry.valid || entry.seq != seq || entry.resends >= l.maxResendsPerSeq {
++				return true
++			}
++			if used+entry.size > budget {
++				return true
++			}
++			used += entry.size
++			entry.resends++
++			stream.resent.add(now, entry.size)
++			allowed = append(allowed, seq)
++			return true
++		})
++	}
++
++	if len(allowed) == requested {
++		return false
++	}
++	nack.Nacks = rtcp.NackPairsFromSequenceNumbers(allowed)
++	return true
++}
+-- 
+2.56.1.vfs.0.1
+

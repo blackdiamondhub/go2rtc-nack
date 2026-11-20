@@ -1,0 +1,913 @@
+From 16868bb66d0c5c73b19d76532539beb566704f70 Mon Sep 17 00:00:00 2001
+From: Stefan Slivinski <sslivins@gmail.com>
+Date: Fri, 20 Nov 2026 11:22:06 -0800
+Subject: [PATCH] feat: talkback source and /api/talk WebSocket for RTP speaker
+ backchannels
+
+Adds a talkback:rtp://<private ipv4>:<port>?codec=opus&rate=<hz> source: a
+backchannel-only producer that pipes 16 kHz s16le PCM into ffmpeg (argv built
+from validated fields, no shell) which sends Opus RTP to the camera, e.g. a
+UniFi Protect talkback session.
+
+GET /api/talk?src=<stream> upgrades to a WebSocket that accepts binary PCM
+frames from a native client and feeds them to the stream's talkback source.
+Same-host origin check, one talker per speaker, frame size and rate limits,
+idle timeout and a 5 minute session cap.
+---
+ internal/talkback/api.go           | 222 +++++++++++++++++++
+ internal/talkback/talkback.go      | 280 +++++++++++++++++++++++
+ internal/talkback/talkback_test.go | 345 +++++++++++++++++++++++++++++
+ main.go                            |   2 +
+ 4 files changed, 849 insertions(+)
+ create mode 100644 internal/talkback/api.go
+ create mode 100644 internal/talkback/talkback.go
+ create mode 100644 internal/talkback/talkback_test.go
+
+diff --git a/internal/talkback/api.go b/internal/talkback/api.go
+new file mode 100644
+index 0000000..e0d9e57
+--- /dev/null
++++ b/internal/talkback/api.go
+@@ -0,0 +1,222 @@
++package talkback
++
++import (
++	"errors"
++	"net/http"
++	"regexp"
++	"sync"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/gorilla/websocket"
++	"github.com/pion/rtp"
++)
++
++const (
++	maxFrame     = 3200 // 100 ms of 16 kHz s16 mono
++	readLimit    = 4096
++	idleTimeout  = 10 * time.Second
++	bytesPerSec  = inputRate * 2 * inputChannels
++	rateBurst    = bytesPerSec // 1 s of audio
++	rateMultiple = 2           // tolerate up to 2x realtime
++)
++
++var (
++	maxSession = 5 * time.Minute
++
++	validName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
++
++	busyMu sync.Mutex
++	busy   = map[string]bool{} // talkback source -> active talker
++
++	upgrader = websocket.Upgrader{
++		ReadBufferSize:  readLimit,
++		WriteBufferSize: 1024,
++		// origin is checked in apiTalk before upgrading
++		CheckOrigin: func(r *http.Request) bool { return true },
++	}
++)
++
++// Conn is the talk client: a consumer that supplies one PCM track as a backchannel.
++type Conn struct {
++	core.Connection
++	mu       sync.Mutex
++	receiver *core.Receiver
++}
++
++func newConn(r *http.Request) *Conn {
++	c := &Conn{
++		Connection: core.Connection{
++			ID:         core.NewID(),
++			FormatName: "talk",
++			Medias: []*core.Media{{
++				Kind:      core.KindAudio,
++				Direction: core.DirectionRecvonly,
++				Codecs:    []*core.Codec{{Name: core.CodecPCML, ClockRate: inputRate, Channels: inputChannels}},
++			}},
++		},
++	}
++	c.WithRequest(r)
++	return c
++}
++
++func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.receiver == nil {
++		c.receiver = core.NewReceiver(media, codec)
++		c.Receivers = append(c.Receivers, c.receiver)
++	}
++	return c.receiver, nil
++}
++
++func (c *Conn) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
++	return core.ErrCantGetTrack
++}
++
++func (c *Conn) Start() error { return nil }
++
++type msg struct {
++	Type  string `json:"type"`
++	Value string `json:"value,omitempty"`
++}
++
++func apiTalk(w http.ResponseWriter, r *http.Request) {
++	if !originAllowed(r.Header.Get("Origin"), r.Host) {
++		http.Error(w, "origin not allowed", http.StatusForbidden)
++		return
++	}
++
++	name := r.URL.Query().Get("src")
++	if !validName.MatchString(name) {
++		http.Error(w, "bad src", http.StatusBadRequest)
++		return
++	}
++	stream := streams.Get(name)
++	if stream == nil {
++		http.Error(w, "stream not found", http.StatusNotFound)
++		return
++	}
++	_, target := talkSource(stream)
++	if target == nil {
++		http.Error(w, "stream has no talkback source", http.StatusBadRequest)
++		return
++	}
++
++	ws, err := upgrader.Upgrade(w, r, nil)
++	if err != nil {
++		return
++	}
++	defer ws.Close()
++	ws.SetReadLimit(readLimit)
++
++	send := func(m msg) {
++		_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
++		_ = ws.WriteJSON(m)
++	}
++	fail := func(reason string) {
++		send(msg{Type: "error", Value: reason})
++		_ = ws.WriteControl(websocket.CloseMessage,
++			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason), time.Now().Add(time.Second))
++	}
++
++	key := target.Addr.String()
++	busyMu.Lock()
++	if busy[key] {
++		busyMu.Unlock()
++		fail("busy")
++		return
++	}
++	busy[key] = true
++	busyMu.Unlock()
++	defer func() {
++		busyMu.Lock()
++		delete(busy, key)
++		busyMu.Unlock()
++	}()
++
++	cons := newConn(r)
++	if err = stream.AddConsumer(cons); err != nil {
++		log.Warn().Err(err).Str("src", name).Msg("[talkback] add consumer")
++		fail("unavailable")
++		return
++	}
++	defer stream.RemoveConsumer(cons)
++
++	cons.mu.Lock()
++	receiver := cons.receiver
++	cons.mu.Unlock()
++	if receiver == nil {
++		fail("unavailable")
++		return
++	}
++
++	log.Debug().Str("src", name).Str("target", key).Str("remote", cons.RemoteAddr).Msg("[talkback] start")
++	send(msg{Type: "ready"})
++
++	err = pump(ws, receiver, time.Now)
++	log.Debug().Err(err).Str("src", name).Msg("[talkback] end")
++	if err != nil && !errors.Is(err, errClientClosed) {
++		fail(err.Error())
++	}
++}
++
++var (
++	errClientClosed = errors.New("closed")
++	errFrame        = errors.New("bad frame")
++	errRate         = errors.New("too fast")
++	errMaxSession   = errors.New("session limit")
++)
++
++// pump reads PCM frames from ws and writes them as RTP packets into receiver until the client
++// closes, misbehaves, idles, or the session limit is reached.
++func pump(ws *websocket.Conn, receiver *core.Receiver, now func() time.Time) error {
++	start := now()
++	deadline := start.Add(maxSession)
++
++	var seq uint16
++	var ts uint32
++	tokens := float64(rateBurst * rateMultiple)
++	last := start
++
++	for {
++		readDeadline := now().Add(idleTimeout)
++		if readDeadline.After(deadline) {
++			readDeadline = deadline
++		}
++		_ = ws.SetReadDeadline(readDeadline)
++
++		mt, data, err := ws.ReadMessage()
++		if err != nil {
++			if !now().Before(deadline) {
++				return errMaxSession
++			}
++			return errClientClosed
++		}
++		if mt != websocket.BinaryMessage {
++			continue // text control messages are ignored; client closes to stop
++		}
++		if len(data) == 0 || len(data) > maxFrame || len(data)%2 != 0 {
++			return errFrame
++		}
++
++		t := now()
++		tokens += t.Sub(last).Seconds() * bytesPerSec * rateMultiple
++		if max := float64(rateBurst * rateMultiple); tokens > max {
++			tokens = max
++		}
++		last = t
++		tokens -= float64(len(data))
++		if tokens < 0 {
++			return errRate
++		}
++
++		seq++
++		receiver.WriteRTP(&rtp.Packet{
++			Header:  rtp.Header{Version: 2, SequenceNumber: seq, Timestamp: ts},
++			Payload: data,
++		})
++		ts += uint32(len(data) / 2)
++	}
++}
+diff --git a/internal/talkback/talkback.go b/internal/talkback/talkback.go
+new file mode 100644
+index 0000000..b4aa68c
+--- /dev/null
++++ b/internal/talkback/talkback.go
+@@ -0,0 +1,280 @@
++// Package talkback sends audio to a camera speaker that accepts a plain Opus RTP stream
++// (e.g. UniFi Protect talkback sessions).
++//
++// Source:   talkback:rtp://<private ipv4>:<port>?codec=opus&rate=<hz>
++// Endpoint: GET /api/talk?src=<stream>  (WebSocket, binary frames of s16le 16 kHz mono PCM)
++//
++// The source is a backchannel-only producer that pipes PCM into ffmpeg, which encodes Opus and
++// sends RTP to the camera. ffmpeg arguments are built from validated fields, never a shell string,
++// so the scheme is safe to add through the API.
++package talkback
++
++import (
++	"errors"
++	"io"
++	"net"
++	"net/netip"
++	"net/url"
++	"os/exec"
++	"strconv"
++	"strings"
++	"sync"
++
++	"github.com/AlexxIT/go2rtc/internal/api"
++	"github.com/AlexxIT/go2rtc/internal/app"
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/rtp"
++	"github.com/rs/zerolog"
++)
++
++const scheme = "talkback"
++
++// PCM format accepted from talk clients and fed to ffmpeg.
++const (
++	inputRate     = 16000
++	inputChannels = 1
++)
++
++var allowedRates = map[int]bool{8000: true, 12000: true, 16000: true, 24000: true, 48000: true}
++
++var (
++	ffmpegBin = "ffmpeg"
++	log       = zerolog.Nop()
++)
++
++func Init() {
++	var cfg struct {
++		Mod struct {
++			Bin string `yaml:"bin"`
++		} `yaml:"ffmpeg"`
++	}
++	app.LoadConfig(&cfg)
++	if cfg.Mod.Bin != "" {
++		ffmpegBin = cfg.Mod.Bin
++	}
++
++	log = app.GetLogger("talkback")
++
++	streams.HandleFunc(scheme, Handle)
++	api.HandleFunc("api/talk", apiTalk)
++}
++
++type Target struct {
++	Addr netip.AddrPort
++	Rate int
++}
++
++// ParseSource validates a talkback source URL.
++func ParseSource(source string) (*Target, error) {
++	rest, ok := strings.CutPrefix(source, scheme+":")
++	if !ok {
++		return nil, errors.New("talkback: wrong scheme")
++	}
++	if strings.ContainsFunc(rest, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
++		return nil, errors.New("talkback: bad url")
++	}
++
++	u, err := url.Parse(rest)
++	if err != nil {
++		return nil, errors.New("talkback: bad url")
++	}
++	if u.Scheme != "rtp" || u.User != nil || (u.Path != "" && u.Path != "/") || u.Fragment != "" || u.Opaque != "" {
++		return nil, errors.New("talkback: expected rtp://ip:port")
++	}
++
++	addr, err := netip.ParseAddrPort(u.Host)
++	if err != nil {
++		return nil, errors.New("talkback: host must be ip:port")
++	}
++	ip := addr.Addr()
++	if !ip.Is4() || !ip.IsPrivate() {
++		return nil, errors.New("talkback: host must be a private IPv4 address")
++	}
++	if addr.Port() == 0 {
++		return nil, errors.New("talkback: bad port")
++	}
++
++	q, err := url.ParseQuery(u.RawQuery)
++	if err != nil {
++		return nil, errors.New("talkback: bad query")
++	}
++	for k, v := range q {
++		if (k != "codec" && k != "rate") || len(v) != 1 {
++			return nil, errors.New("talkback: bad parameter " + k)
++		}
++	}
++	if c := q.Get("codec"); c != "" && c != "opus" {
++		return nil, errors.New("talkback: unsupported codec")
++	}
++
++	rate := 48000
++	if s := q.Get("rate"); s != "" {
++		if rate, err = strconv.Atoi(s); err != nil || !allowedRates[rate] {
++			return nil, errors.New("talkback: unsupported rate")
++		}
++	}
++
++	return &Target{Addr: addr, Rate: rate}, nil
++}
++
++// Args returns the ffmpeg argv (without the binary).
++func (t *Target) Args() []string {
++	return []string{
++		"-hide_banner", "-loglevel", "error",
++		"-fflags", "nobuffer", "-flags", "low_delay",
++		"-f", "s16le", "-ar", strconv.Itoa(inputRate), "-ac", strconv.Itoa(inputChannels), "-i", "pipe:0",
++		"-c:a", "libopus", "-application", "voip", "-b:a", "32k", "-frame_duration", "20",
++		"-ac", "1", "-ar", strconv.Itoa(t.Rate),
++		"-f", "rtp", "rtp://" + t.Addr.String(),
++	}
++}
++
++func Handle(source string) (core.Producer, error) {
++	t, err := ParseSource(source)
++	if err != nil {
++		return nil, err
++	}
++	return newProducer(source, t)
++}
++
++// Producer is a backchannel-only producer: it accepts one PCM audio track and pipes it into
++// ffmpeg. Start blocks while ffmpeg runs; Stop kills it.
++type Producer struct {
++	core.Connection
++
++	cmd   *exec.Cmd
++	stdin io.WriteCloser
++
++	mu      sync.Mutex
++	stopped bool
++	done    chan struct{}
++}
++
++func newProducer(source string, t *Target) (*Producer, error) {
++	cmd := exec.Command(ffmpegBin, t.Args()...)
++	stdin, err := cmd.StdinPipe()
++	if err != nil {
++		return nil, err
++	}
++	cmd.Stderr = logWriter{}
++
++	return &Producer{
++		Connection: core.Connection{
++			ID:         core.NewID(),
++			FormatName: scheme,
++			Protocol:   "rtp",
++			RemoteAddr: t.Addr.String(),
++			Source:     source,
++			URL:        source,
++			Medias: []*core.Media{{
++				Kind:      core.KindAudio,
++				Direction: core.DirectionSendonly,
++				Codecs:    []*core.Codec{{Name: core.CodecPCML, ClockRate: inputRate, Channels: inputChannels}},
++			}},
++		},
++		cmd:   cmd,
++		stdin: stdin,
++		done:  make(chan struct{}),
++	}, nil
++}
++
++func (p *Producer) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
++	return nil, core.ErrCantGetTrack
++}
++
++func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Receiver) error {
++	sender := core.NewSender(media, track.Codec)
++	sender.Handler = func(packet *rtp.Packet) {
++		n, err := p.stdin.Write(packet.Payload)
++		p.Send += n
++		if err != nil {
++			log.Trace().Err(err).Msg("[talkback] write")
++		}
++	}
++	sender.HandleRTP(track)
++	p.Senders = append(p.Senders, sender)
++	return nil
++}
++
++func (p *Producer) Start() error {
++	p.mu.Lock()
++	if p.stopped {
++		p.mu.Unlock()
++		return nil
++	}
++	err := p.cmd.Start()
++	p.mu.Unlock()
++	if err != nil {
++		close(p.done)
++		return err
++	}
++
++	log.Debug().Msgf("[talkback] ffmpeg started pid=%d target=%s", p.cmd.Process.Pid, p.RemoteAddr)
++	err = p.cmd.Wait()
++	close(p.done)
++	return err
++}
++
++func (p *Producer) Stop() error {
++	p.mu.Lock()
++	if p.stopped {
++		p.mu.Unlock()
++		return nil
++	}
++	p.stopped = true
++	started := p.cmd.Process != nil
++	p.mu.Unlock()
++
++	_ = p.stdin.Close()
++	if started {
++		_ = p.cmd.Process.Kill()
++		<-p.done
++	}
++	return p.Connection.Stop()
++}
++
++type logWriter struct{}
++
++func (logWriter) Write(b []byte) (int, error) {
++	log.Warn().Msgf("[talkback] ffmpeg: %s", strings.TrimSpace(string(b)))
++	return len(b), nil
++}
++
++// talkSource returns the stream's talkback source, if it has exactly one.
++func talkSource(stream *streams.Stream) (string, *Target) {
++	var found string
++	for _, s := range stream.Sources() {
++		if strings.HasPrefix(s, scheme+":") {
++			if found != "" {
++				return "", nil
++			}
++			found = s
++		}
++	}
++	if found == "" {
++		return "", nil
++	}
++	t, err := ParseSource(found)
++	if err != nil {
++		return "", nil
++	}
++	return found, t
++}
++
++// originAllowed accepts native clients (no Origin) and pages served from the same host on any
++// port (the cameras UI runs on a different port of the hub than go2rtc).
++func originAllowed(origin, host string) bool {
++	if origin == "" {
++		return true
++	}
++	u, err := url.Parse(origin)
++	if err != nil || u.Host == "" {
++		return false
++	}
++	reqHost := host
++	if h, _, err := net.SplitHostPort(host); err == nil {
++		reqHost = h
++	}
++	return strings.EqualFold(u.Hostname(), strings.Trim(reqHost, "[]"))
++}
+diff --git a/internal/talkback/talkback_test.go b/internal/talkback/talkback_test.go
+new file mode 100644
+index 0000000..d35ae9c
+--- /dev/null
++++ b/internal/talkback/talkback_test.go
+@@ -0,0 +1,345 @@
++package talkback
++
++import (
++	"bytes"
++	"encoding/binary"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/gorilla/websocket"
++)
++
++// The test binary doubles as a fake ffmpeg: it records argv and copies stdin to a file.
++func TestMain(m *testing.M) {
++	if os.Getenv("GO_TALKBACK_HELPER") == "1" {
++		out := os.Getenv("GO_TALKBACK_OUT")
++		_ = os.WriteFile(out+".args", []byte(strings.Join(os.Args[1:], "\n")), 0o644)
++		f, err := os.Create(out)
++		if err != nil {
++			os.Exit(1)
++		}
++		buf := make([]byte, 640)
++		for {
++			n, err := os.Stdin.Read(buf)
++			if n > 0 {
++				_, _ = f.Write(buf[:n])
++				_ = f.Sync()
++			}
++			if err != nil {
++				os.Exit(0)
++			}
++		}
++	}
++
++	ffmpegBin = os.Args[0]
++	streams.HandleFunc(scheme, Handle)
++	os.Exit(m.Run())
++}
++
++func TestParseSource(t *testing.T) {
++	good := map[string]Target{
++		"talkback:rtp://192.168.1.135:7004?codec=opus&rate=24000": {Rate: 24000},
++		"talkback:rtp://10.0.0.5:8181?codec=opus&rate=48000":      {Rate: 48000},
++		"talkback:rtp://172.16.3.4:1":                             {Rate: 48000},
++	}
++	for src, want := range good {
++		got, err := ParseSource(src)
++		if err != nil {
++			t.Errorf("%s: unexpected error %v", src, err)
++			continue
++		}
++		if got.Rate != want.Rate {
++			t.Errorf("%s: rate %d, want %d", src, got.Rate, want.Rate)
++		}
++	}
++
++	bad := []string{
++		"rtp://192.168.1.135:7004",                              // wrong scheme
++		"talkback:udp://192.168.1.135:7004",                     // not rtp
++		"talkback:rtp://8.8.8.8:7004",                           // public
++		"talkback:rtp://127.0.0.1:7004",                         // loopback
++		"talkback:rtp://camera.local:7004",                      // hostname
++		"talkback:rtp://[fd00::1]:7004",                         // ipv6
++		"talkback:rtp://192.168.1.135",                          // no port
++		"talkback:rtp://192.168.1.135:0",                        // port 0
++		"talkback:rtp://192.168.1.135:70000",                    // port range
++		"talkback:rtp://192.168.1.135:7004?codec=pcmu",          // codec
++		"talkback:rtp://192.168.1.135:7004?rate=44100",          // rate
++		"talkback:rtp://192.168.1.135:7004?rate=24000x",         // rate junk
++		"talkback:rtp://192.168.1.135:7004?codec=opus&x=1",      // unknown param
++		"talkback:rtp://192.168.1.135:7004/evil",                // path
++		"talkback:rtp://u:p@192.168.1.135:7004",                 // userinfo
++		"talkback:rtp://192.168.1.135:7004#-f null",             // fragment
++		"talkback:rtp://192.168.1.135:7004 -i /etc/passwd",      // whitespace injection
++		"talkback:rtp://192.168.1.135:7004?rate=24000;rm%20-rf", // shell junk
++		"talkback:rtp://192.168.1.135:7004?rate=24000&rate=-y",  // repeated param
++	}
++	for _, src := range bad {
++		if _, err := ParseSource(src); err == nil {
++			t.Errorf("%s: expected error", src)
++		}
++	}
++}
++
++func TestArgs(t *testing.T) {
++	tg, err := ParseSource("talkback:rtp://192.168.1.135:7004?codec=opus&rate=24000")
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := strings.Join(tg.Args(), " ")
++	for _, want := range []string{
++		"-f s16le -ar 16000 -ac 1 -i pipe:0",
++		"-c:a libopus",
++		"-ar 24000",
++		"-f rtp rtp://192.168.1.135:7004",
++	} {
++		if !strings.Contains(got, want) {
++			t.Errorf("args %q missing %q", got, want)
++		}
++	}
++	if args := tg.Args(); args[len(args)-1] != "rtp://192.168.1.135:7004" {
++		t.Errorf("last arg %q", args[len(args)-1])
++	}
++}
++
++func TestOriginAllowed(t *testing.T) {
++	cases := []struct {
++		origin, host string
++		ok           bool
++	}{
++		{"", "192.168.1.179:11900", true},
++		{"http://192.168.1.179:9101", "192.168.1.179:11900", true},
++		{"http://HomeHub.mi:8000", "homehub.mi:11900", true},
++		{"http://evil.example", "192.168.1.179:11900", false},
++		{"http://192.168.1.180:9101", "192.168.1.179:11900", false},
++		{"null", "192.168.1.179:11900", false},
++	}
++	for _, c := range cases {
++		if got := originAllowed(c.origin, c.host); got != c.ok {
++			t.Errorf("origin %q host %q: %v, want %v", c.origin, c.host, got, c.ok)
++		}
++	}
++}
++
++type harness struct {
++	t   *testing.T
++	srv *httptest.Server
++	out string
++}
++
++func newHarness(t *testing.T, name, source string) *harness {
++	t.Helper()
++	out := filepath.Join(t.TempDir(), "pcm")
++	t.Setenv("GO_TALKBACK_HELPER", "1")
++	t.Setenv("GO_TALKBACK_OUT", out)
++
++	if _, err := streams.New(name, source); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { streams.Delete(name) })
++
++	srv := httptest.NewServer(http.HandlerFunc(apiTalk))
++	t.Cleanup(srv.Close)
++	return &harness{t: t, srv: srv, out: out}
++}
++
++func (h *harness) dial(query string, header http.Header) (*websocket.Conn, *http.Response, error) {
++	u := "ws" + strings.TrimPrefix(h.srv.URL, "http") + "/api/talk?" + query
++	return websocket.DefaultDialer.Dial(u, header)
++}
++
++func readMsg(t *testing.T, ws *websocket.Conn) msg {
++	t.Helper()
++	_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
++	var m msg
++	if err := ws.ReadJSON(&m); err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	return m
++}
++
++func pcmFrames(n int) [][]byte {
++	frames := make([][]byte, n)
++	var s int16
++	for i := range frames {
++		b := make([]byte, 640)
++		for j := 0; j < len(b); j += 2 {
++			binary.LittleEndian.PutUint16(b[j:], uint16(s))
++			s++
++		}
++		frames[i] = b
++	}
++	return frames
++}
++
++func waitFile(t *testing.T, path string, size int) []byte {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		if b, err := os.ReadFile(path); err == nil && len(b) >= size {
++			return b
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	b, _ := os.ReadFile(path)
++	t.Fatalf("%s: got %d bytes, want %d", path, len(b), size)
++	return nil
++}
++
++func TestTalkEndToEnd(t *testing.T) {
++	h := newHarness(t, "door_talk", "talkback:rtp://192.168.1.135:7004?codec=opus&rate=24000")
++
++	ws, _, err := h.dial("src=door_talk", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ws.Close()
++	if m := readMsg(t, ws); m.Type != "ready" {
++		t.Fatalf("got %+v, want ready", m)
++	}
++
++	frames := pcmFrames(10)
++	var want bytes.Buffer
++	for _, f := range frames {
++		want.Write(f)
++		if err = ws.WriteMessage(websocket.BinaryMessage, f); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	got := waitFile(t, h.out, want.Len())
++	if !bytes.Equal(got[:want.Len()], want.Bytes()) {
++		t.Fatal("PCM bytes arrived out of order or corrupted")
++	}
++
++	args, _ := os.ReadFile(h.out + ".args")
++	if !strings.Contains(string(args), "rtp://192.168.1.135:7004") {
++		t.Errorf("ffmpeg args %q", args)
++	}
++
++	// a second talker on the same speaker is rejected while the first is active
++	ws2, _, err := h.dial("src=door_talk", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if m := readMsg(t, ws2); m.Type != "error" || m.Value != "busy" {
++		t.Fatalf("got %+v, want busy", m)
++	}
++	ws2.Close()
++
++	// after the first talker leaves, the speaker is free again and the producer was stopped
++	_ = ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
++	ws.Close()
++	deadline := time.Now().Add(5 * time.Second)
++	for {
++		busyMu.Lock()
++		free := !busy["192.168.1.135:7004"]
++		busyMu.Unlock()
++		if free {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("speaker still busy after client closed")
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++
++	ws3, _, err := h.dial("src=door_talk", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ws3.Close()
++	if m := readMsg(t, ws3); m.Type != "ready" {
++		t.Fatalf("reconnect: got %+v, want ready", m)
++	}
++}
++
++func TestTalkRejectsBadFrames(t *testing.T) {
++	h := newHarness(t, "frames_talk", "talkback:rtp://192.168.1.136:7004?codec=opus&rate=24000")
++
++	for name, frame := range map[string][]byte{
++		"odd":   make([]byte, 641),
++		"large": make([]byte, maxFrame+2),
++		"empty": {},
++	} {
++		ws, _, err := h.dial("src=frames_talk", nil)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if m := readMsg(t, ws); m.Type != "ready" {
++			t.Fatalf("%s: got %+v, want ready", name, m)
++		}
++		_ = ws.WriteMessage(websocket.BinaryMessage, frame)
++		if m := readMsg(t, ws); m.Type != "error" {
++			t.Errorf("%s: got %+v, want error", name, m)
++		}
++		ws.Close()
++		time.Sleep(50 * time.Millisecond) // let the server release the speaker
++	}
++}
++
++func TestTalkRejectsFlood(t *testing.T) {
++	h := newHarness(t, "flood_talk", "talkback:rtp://192.168.1.137:7004?codec=opus&rate=24000")
++	ws, _, err := h.dial("src=flood_talk", nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer ws.Close()
++	if m := readMsg(t, ws); m.Type != "ready" {
++		t.Fatalf("got %+v", m)
++	}
++	// 5 s of audio as fast as possible exceeds the 2 s burst allowance
++	frame := make([]byte, maxFrame)
++	for i := 0; i < 50; i++ {
++		if err = ws.WriteMessage(websocket.BinaryMessage, frame); err != nil {
++			break
++		}
++	}
++	if m := readMsg(t, ws); m.Type != "error" || m.Value != errRate.Error() {
++		t.Fatalf("got %+v, want rate error", m)
++	}
++}
++
++func TestTalkRejectsRequests(t *testing.T) {
++	h := newHarness(t, "plain", "talkback:rtp://192.168.1.138:7004")
++
++	cases := []struct {
++		query  string
++		origin string
++		status int
++	}{
++		{"src=missing", "", http.StatusNotFound},
++		{"src=bad%20name", "", http.StatusBadRequest},
++		{"src=", "", http.StatusBadRequest},
++		{"src=plain", "http://evil.example", http.StatusForbidden},
++	}
++	for _, c := range cases {
++		header := http.Header{}
++		if c.origin != "" {
++			header.Set("Origin", c.origin)
++		}
++		_, resp, err := h.dial(c.query, header)
++		if err == nil {
++			t.Errorf("%s: expected dial failure", c.query)
++			continue
++		}
++		if resp == nil || resp.StatusCode != c.status {
++			code := 0
++			if resp != nil {
++				code = resp.StatusCode
++			}
++			t.Errorf("%s origin=%q: status %d, want %d", c.query, c.origin, code, c.status)
++		}
++		if resp != nil {
++			_, _ = io.Copy(io.Discard, resp.Body)
++			resp.Body.Close()
++		}
++	}
++}
+diff --git a/main.go b/main.go
+index 7cc6d24..4c8217e 100644
+--- a/main.go
++++ b/main.go
+@@ -39,6 +39,7 @@ import (
+ 	"github.com/AlexxIT/go2rtc/internal/rtsp"
+ 	"github.com/AlexxIT/go2rtc/internal/srtp"
+ 	"github.com/AlexxIT/go2rtc/internal/streams"
++	"github.com/AlexxIT/go2rtc/internal/talkback"
+ 	"github.com/AlexxIT/go2rtc/internal/tapo"
+ 	"github.com/AlexxIT/go2rtc/internal/tuya"
+ 	"github.com/AlexxIT/go2rtc/internal/v4l2"
+@@ -85,6 +86,7 @@ func main() {
+ 		{"exec", exec.Init},
+ 		{"expr", expr.Init},
+ 		{"ffmpeg", ffmpeg.Init},
++		{"talkback", talkback.Init}, // talkback:rtp:// source and /api/talk WebSocket
+ 		// Hardware sources
+ 		{"alsa", alsa.Init},
+ 		{"v4l2", v4l2.Init},
+-- 
+2.56.1.vfs.0.1
+

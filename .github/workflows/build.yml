@@ -92,6 +92,7 @@ jobs:
         run: |
           go test -count=1 -timeout 5m -skip '^TestURLParse$' ./pkg/webrtc/ ./pkg/rtsp/ ./pkg/tcp/ ./internal/rtsp/
           go test -count=1 -timeout 5m -run Keyframe ./internal/streams/
+          go test -count=1 -timeout 5m -race ./internal/talkback/
 
       - uses: docker/setup-qemu-action@v3
         if: steps.skip.outputs.skip != 'true'
@@ -118,6 +119,18 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://localhost:1984/api >/dev/null && break; sleep 1; done
           curl -sf http://localhost:1984/api
           curl -sf http://localhost:1984/api/streams | grep -q test
+          # talkback: the API accepts the source, rejects a stream without one, and ffmpeg has libopus
+          curl -sf -X PUT 'http://localhost:1984/api/streams?name=talk&src=talkback:rtp://192.168.1.2:7004?codec=opus%26rate=24000'
+          curl -sf http://localhost:1984/api/streams | grep -q 'talkback:rtp://192.168.1.2:7004'
+          # go2rtc doesn't validate sources on PUT; /api/talk refuses a public target before upgrading
+          curl -sf -X PUT 'http://localhost:1984/api/streams?name=bad&src=talkback:rtp://8.8.8.8:7004'
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:1984/api/talk?src=bad')" = 400
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:1984/api/talk?src=test')" = 400
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+            -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 'http://localhost:1984/api/talk?src=talk' || true)
+          test "$code" = 101
+          docker exec g2 ffmpeg -hide_banner -encoders | grep -q libopus
           docker logs g2
           docker rm -f g2
 

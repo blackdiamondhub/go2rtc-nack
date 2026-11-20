@@ -122,8 +122,14 @@ jobs:
           # talkback: the API accepts the source, rejects a stream without one, and ffmpeg has libopus
           curl -sf -X PUT 'http://localhost:1984/api/streams?name=talk&src=talkback:rtp://192.168.1.2:7004?codec=opus%26rate=24000'
           curl -sf http://localhost:1984/api/streams | grep -q 'talkback:rtp://192.168.1.2:7004'
-          if curl -sf -X PUT 'http://localhost:1984/api/streams?name=bad&src=talkback:rtp://8.8.8.8:7004'; then exit 1; fi
+          # go2rtc doesn't validate sources on PUT; /api/talk refuses a public target before upgrading
+          curl -sf -X PUT 'http://localhost:1984/api/streams?name=bad&src=talkback:rtp://8.8.8.8:7004'
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:1984/api/talk?src=bad')" = 400
           test "$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:1984/api/talk?src=test')" = 400
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+            -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' 'http://localhost:1984/api/talk?src=talk' || true)
+          test "$code" = 101
           docker exec g2 ffmpeg -hide_banner -encoders | grep -q libopus
           docker logs g2
           docker rm -f g2

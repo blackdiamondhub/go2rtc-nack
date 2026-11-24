@@ -17,7 +17,7 @@ essentially none.
 ## Image
 
 ```
-ghcr.io/blackdiamondlodge/go2rtc-nack:latest
+ghcr.io/blackdiamondhub/go2rtc-nack:latest
 ```
 
 A drop-in replacement for `alexxit/go2rtc` (built with upstream's own
